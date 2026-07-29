@@ -1,0 +1,280 @@
+diff --git a/qt_client/src/MainWindowRepos.cpp b/qt_client/src/MainWindowRepos.cpp
+index f627f708..5d7c67ec 100644
+--- a/qt_client/src/MainWindowRepos.cpp
++++ b/qt_client/src/MainWindowRepos.cpp
+@@ -10,6 +10,116 @@
+ 
+ using namespace forkmesh::ui;
+ 
++namespace {
++
++struct PublishRepositorySnapshot {
++    QString rootCommit;
++    QString stateHash;
++    QString publishedWebsite;
++    QString publishedDescription;
++    QString headBranch;
++    QString headCommit;
++    int issueCount = -1;
++    int commitCount = -1;
++    int branchCount = -1;
++    int pullCount = -1;
++    int discussionCount = -1;
++    int worktreeCount = -1;
++    int artifactCount = -1;
++    qint64 sizeBytes = 0;
++};
++
++QString hashPublishedRefs(const QByteArray &out)
++{
++    QStringList lines;
++    const QStringList rows = QString::fromUtf8(out).split('\n', Qt::SkipEmptyParts);
++    for (const QString &raw : rows) {
++        const QString line = raw.trimmed();
++        if (line.isEmpty() || line.endsWith(QStringLiteral("^{}")))
++            continue;
++        lines.append(line);
++    }
++    lines.sort();
++    return QString::fromUtf8(
++        QCryptographicHash::hash(lines.join('\n').toUtf8(),
++                                 QCryptographicHash::Sha256)
++            .toHex());
++}
++
++QString publishRootCommit(const RepositoryRecord &repo)
++{
++    const QString gitDir =
++        (!repo.localPath.trimmed().isEmpty() && QDir(repo.localPath).exists(".git"))
++            ? repo.localPath
++            : repo.mirrorPath;
++    auto firstRoot = [&](const QStringList &args) -> QString {
++        QByteArray out;
++        if (gitDir.trimmed().isEmpty() || !runGitCapture(gitDir, args, &out, nullptr))
++            return QString();
++        const QStringList roots =
++            QString::fromUtf8(out).split('\n', Qt::SkipEmptyParts);
++        return roots.isEmpty() ? QString() : roots.last().trimmed();
++    };
++    QString rootCommit = firstRoot({"rev-list", "--max-parents=0", "HEAD"});
++    if (rootCommit.isEmpty()) {
++        const QString branch = mirrorHeadBranch(gitDir);
++        if (!branch.isEmpty())
++            rootCommit = firstRoot({"rev-list", "--max-parents=0", branch});
++    }
++    if (rootCommit.isEmpty())
++        rootCommit = firstRoot({"rev-list", "--max-parents=0", "--all"});
++    return rootCommit;
++}
++
++QString publishStateHash(const QString &mirrorPath)
++{
++    if (mirrorPath.trimmed().isEmpty())
++        return QString();
++    QByteArray out;
++    if (!runGitCapture(mirrorPath,
++                       {"for-each-ref", "--format=%(objectname) %(refname)",
++                        "refs/heads/", "refs/tags/"},
++                       &out, nullptr))
++        return QString();
++    return hashPublishedRefs(out);
++}
++
++PublishRepositorySnapshot collectPublishRepositorySnapshot(
++    const RepositoryRecord &repo)
++{
++    PublishRepositorySnapshot snapshot;
++    snapshot.rootCommit = publishRootCommit(repo);
++    snapshot.stateHash = publishStateHash(repo.mirrorPath);
++    snapshot.publishedDescription = repo.description;
++    if (!repo.localPath.trimmed().isEmpty()) {
++        QFile file(QDir(repo.localPath).filePath(kRepoInfoPath));
++        if (file.open(QIODevice::ReadOnly)) {
++            const QJsonObject info = QJsonDocument::fromJson(file.readAll()).object();
++            snapshot.publishedWebsite =
++                info.value(QStringLiteral("website")).toString();
++            const QString about =
++                info.value(QStringLiteral("about")).toString().trimmed();
++            if (!about.isEmpty())
++                snapshot.publishedDescription = about;
++        }
++    }
++
++    snapshot.headBranch = mirrorHeadBranch(repo.mirrorPath);
++    snapshot.headCommit = mirrorBranchCommit(repo.mirrorPath, snapshot.headBranch);
++    snapshot.issueCount = mirrorIssueCount(repo.mirrorPath, snapshot.headBranch);
++    snapshot.commitCount = mirrorCommitCount(repo.mirrorPath, snapshot.headBranch);
++    snapshot.branchCount = mirrorBranchCount(repo.mirrorPath);
++    snapshot.pullCount = mirrorPullCount(repo.mirrorPath, snapshot.headBranch);
++    snapshot.discussionCount =
++        mirrorDiscussionCount(repo.mirrorPath, snapshot.headBranch);
++    snapshot.worktreeCount = mirrorWorktreeCount(repo.localPath);
++    snapshot.artifactCount = mirrorArtifactCount(repo.mirrorPath);
++    snapshot.sizeBytes = mirrorRepoSizeBytes(repo.mirrorPath);
++    return snapshot;
++}
++
++} // namespace
++
+ // ------------------------------------------------------------- repositories
+ 
+ QString MainWindow::repositoryMirrorRoot() const
+@@ -1898,76 +2008,20 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+     const QString owner = catalogOwner(repo);
+     const QString name = repoSegment(repo.name, QStringLiteral("repository"));
+     const QString updatedAt = QString::number(now);
+-    // A stable identity for the logical repo: its first (root) commit, shared by
+-    // every node mirroring it. The network page groups mirrors by this so the same
+-    // repo under different owners shows as one card. Not part of the signature.
+-    QString rootCommit;
+-    {
+-        const QString gitDir =
+-            (!repo.localPath.trimmed().isEmpty() && QDir(repo.localPath).exists(".git"))
+-                ? repo.localPath
+-                : repo.mirrorPath;
+-        // Resolve the earliest root commit. Prefer HEAD; but a bare mirror cloned
+-        // from the relay can carry an unset/dangling HEAD (the relay serves
+-        // git-upload-pack without advertising a symref HEAD), so "rev-list ... HEAD"
+-        // fails and leaves rootCommit empty. A wrong/empty root drops that mirror
+-        // into a different group key (worker repo_mirror_group_key), so the owner's
+-        // mirror-nodes panel never lists it next to the source of truth — the node
+-        // shows up on the mirror but not on the source (issue #243, adhoc #134).
+-        auto firstRoot = [&](const QStringList &args) -> QString {
+-            QByteArray out;
+-            if (gitDir.trimmed().isEmpty() ||
+-                !runGitCapture(gitDir, args, &out, nullptr))
+-                return QString();
+-            const QStringList roots =
+-                QString::fromUtf8(out).split('\n', Qt::SkipEmptyParts);
+-            return roots.isEmpty() ? QString() : roots.last().trimmed();
+-        };
+-        rootCommit = firstRoot({"rev-list", "--max-parents=0", "HEAD"});
+-        if (rootCommit.isEmpty()) {
+-            // HEAD is unset. Compute the root of the branch this mirror actually
+-            // serves (mirrorHeadBranch: the same default branch the source's HEAD
+-            // points to), NOT a blind "--all" walk. This repo has several root
+-            // commits — one per independent history the mirror also holds (agent
+-            // branches, imported subtrees). "rev-list --max-parents=0 --all" returns
+-            // ALL of them and "roots.last()" would pick whichever an unrelated
+-            // history contributes, so the mirror published a different rootCommit
+-            // than the source and landed in its own group (adhoc #134). Resolving
+-            // the served branch yields the source's root regardless of HEAD's state.
+-            const QString branch = mirrorHeadBranch(gitDir);
+-            if (!branch.isEmpty())
+-                rootCommit = firstRoot({"rev-list", "--max-parents=0", branch});
+-        }
+-        // Last resort (no HEAD and no resolvable served branch, e.g. a truly empty
+-        // ref set): fall back to --all so a single-root mirror still groups.
+-        if (rootCommit.isEmpty())
+-            rootCommit = firstRoot({"rev-list", "--max-parents=0", "--all"});
+-    }
+-    // Owner-signed fingerprint of the refs this node serves (sha256 over the
+-    // canonical heads+tags advertisement). The relay pins this and refuses to
+-    // serve any mirror whose live advertisement doesn't hash to it, so a tampered
+-    // or rolled-back mirror can never be cloned. MUST match the worker's
+-    // advertised_refs_canonical(): "<sha> <refname>" lines for refs/heads/* and
+-    // refs/tags/* only, sorted, joined by '\n'.
+-    const QString stateHash = mirrorStateHash(repo.mirrorPath);
+-    // Repository details (about text + website) live in the committed
+-    // .forkmesh/info.json, the single source of truth (issue #232). Prefer it over
+-    // the locally-cached record fields so the website's About panel is filled from
+-    // info.json even for a mirror that cloned the repo but never had its
+-    // description typed in locally (adhoc #86).
+-    QString publishedWebsite;
+-    QString publishedDescription = repo.description;
+-    if (!repo.localPath.trimmed().isEmpty()) {
+-        QFile file(QDir(repo.localPath).filePath(kRepoInfoPath));
+-        if (file.open(QIODevice::ReadOnly)) {
+-            const QJsonObject info = QJsonDocument::fromJson(file.readAll()).object();
+-            publishedWebsite = info.value(QStringLiteral("website")).toString();
+-            const QString about =
+-                info.value(QStringLiteral("about")).toString().trimmed();
+-            if (!about.isEmpty())
+-                publishedDescription = about;
+-        }
+-    }
++    const RepositoryRecord repoSnapshot = repo;
++    runOffThread<PublishRepositorySnapshot>(
++        [repoSnapshot] { return collectPublishRepositorySnapshot(repoSnapshot); },
++        [this, index, showDialogOnError, owner, name, updatedAt,
++         repoSnapshot](PublishRepositorySnapshot snapshot) mutable {
++    if (index < 0 || index >= m_repositories.size())
++        return;
++    RepositoryRecord &repo = m_repositories[index];
++    if (repo.previewOnly || repo.owner != repoSnapshot.owner ||
++        repo.name != repoSnapshot.name || repo.mirrorPath != repoSnapshot.mirrorPath)
++        return;
++
++    QString publishedWebsite = snapshot.publishedWebsite;
++    QString publishedDescription = snapshot.publishedDescription;
+     if (index == m_repoDetailIndex) {
+         if (publishedWebsite.isEmpty())
+             publishedWebsite = m_repoInfo.website;
+@@ -1982,15 +2036,15 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+     // everything but sync time and size (adhoc #56). The HEAD/issue figures mirror
+     // the live advert (setMirroredRepos); platform/version/id come from our own
+     // roster entry (the same values makeMessage broadcasts).
+-    const QString headBranch = mirrorHeadBranch(repo.mirrorPath);
+-    const QString headCommit = mirrorBranchCommit(repo.mirrorPath, headBranch);
+-    const int issueCount = mirrorIssueCount(repo.mirrorPath, headBranch);
+-    const int commitCount = mirrorCommitCount(repo.mirrorPath, headBranch);
+-    const int branchCount = mirrorBranchCount(repo.mirrorPath);
+-    const int pullCount = mirrorPullCount(repo.mirrorPath, headBranch);
+-    const int discussionCount = mirrorDiscussionCount(repo.mirrorPath, headBranch);
+-    const int worktreeCount = mirrorWorktreeCount(repo.localPath);
+-    const int artifactCount = mirrorArtifactCount(repo.mirrorPath);
++    const QString &headBranch = snapshot.headBranch;
++    const QString &headCommit = snapshot.headCommit;
++    const int issueCount = snapshot.issueCount;
++    const int commitCount = snapshot.commitCount;
++    const int branchCount = snapshot.branchCount;
++    const int pullCount = snapshot.pullCount;
++    const int discussionCount = snapshot.discussionCount;
++    const int worktreeCount = snapshot.worktreeCount;
++    const int artifactCount = snapshot.artifactCount;
+     QString selfPlatform, selfVersion, selfNodeId;
+     for (const MemberInfo &member : std::as_const(m_homeRoster)) {
+         if (member.self) {
+@@ -2033,11 +2087,10 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+                          {"hostedSince", QString::number(repo.hostedSinceMs)},
+                          {"lastSync", QString::number(repo.lastSyncMs)},
+                          {"updatedAt", updatedAt},
+-                         {"rootCommit", rootCommit},
++                         {"rootCommit", snapshot.rootCommit},
+                          // On-disk mirror size so the network page can show how
+                          // much data each owner/repo is hosting. Not signed.
+-                         {"sizeBytes",
+-                          QString::number(mirrorRepoSizeBytes(repo.mirrorPath))},
++                         {"sizeBytes", QString::number(snapshot.sizeBytes)},
+                          {"visibility", repo.isPrivate
+                                             ? QStringLiteral("private")
+                                             : QStringLiteral("public")},
+@@ -2053,11 +2106,11 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+     metadata.insert("catalogSig", m_profileIdentity.signData(catalogCanonical));
+     // Attest the served refs so the relay can detect a tampered/stale mirror.
+     // Signed with the same account key the relay verifies for the catalog write.
+-    if (!stateHash.isEmpty()) {
+-        metadata.insert("stateHash", stateHash);
++    if (!snapshot.stateHash.isEmpty()) {
++        metadata.insert("stateHash", snapshot.stateHash);
+         const QByteArray stateCanonical =
+-            ("forkmesh-repostate-v1\n" + owner + "\n" + name + "\n" + stateHash +
+-             "\n" + updatedAt)
++            ("forkmesh-repostate-v1\n" + owner + "\n" + name + "\n" +
++             snapshot.stateHash + "\n" + updatedAt)
+                 .toUtf8();
+         metadata.insert("stateSig", m_profileIdentity.signData(stateCanonical));
+     }
+@@ -2119,6 +2172,7 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+                 if (showDialogOnError)
+                     flashMessage(message, /*error=*/true);
+             });
++        });
+ }
+ 
+ namespace {
+@@ -3018,4 +3072,3 @@ void MainWindow::uninstallForkMesh()
+ 
+     QCoreApplication::exit(0);
+ }
+-

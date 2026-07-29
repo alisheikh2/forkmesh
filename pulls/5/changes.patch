@@ -1,0 +1,169 @@
+diff --git a/qt_client/src/MainWindow.h b/qt_client/src/MainWindow.h
+index c066b25f..27839bed 100644
+--- a/qt_client/src/MainWindow.h
++++ b/qt_client/src/MainWindow.h
+@@ -291,6 +291,14 @@ public:
+                    ? QString()
+                    : repoAgentGitDir(m_repositories.at(index));
+     }
++    qint64 testCachedMirrorRepoSizeBytes(int index, bool refreshIfStale)
++    {
++        return (index < 0 || index >= m_repositories.size())
++                   ? -1
++                   : cachedMirrorRepoSizeBytes(m_repositories.at(index),
++                                               refreshIfStale);
++    }
++    int testMirrorRepoSizeRefreshes() const { return m_testMirrorRepoSizeRefreshes; }
+     void testPublishRepository(int index) { publishRepository(index, false); }
+     void testStartRepoHosts() { startRepoHosts(); }
+     void testStopRepoHosts() { stopRepoHosts(); }
+@@ -1597,6 +1605,8 @@ private:
+     bool proposePullFromMirrorEdit(const QString &cleanPath, const QString &content);
+     void loadRepoInfo();
+     void loadBranchesAndTags();
++    qint64 cachedMirrorRepoSizeBytes(const RepositoryRecord &repo,
++                                     bool refreshIfStale = true);
+     QStringList repoBranches() const;
+     QString repoDefaultBranch(const QStringList &branches) const;
+     QWidget *buildBranchesTab();
+@@ -4215,6 +4225,16 @@ private:
+     // onRequestServed (adhoc #83); skip the rebuild while the signature is
+     // unchanged. Reset by attachBackend so a freshly attached backend is re-pushed.
+     QString m_mirrorAdvertSig;
++    struct MirrorRepoSizeCacheEntry {
++        qint64 syncMs = -1;
++        qint64 bytes = 0;
++        bool valid = false;
++    };
++    QHash<QString, MirrorRepoSizeCacheEntry> m_mirrorRepoSizeCache;
++    QSet<QString> m_mirrorRepoSizeRefreshes;
++#ifdef FORKMESH_WINDOW_TESTS
++    int m_testMirrorRepoSizeRefreshes = 0;
++#endif
+     int m_repoOpenPending = -1;        // repo index queued by openRepoDetailDeferred
+     // True while a user-driven repo load (a node switch or opening a repo) runs,
+     // so nodeSwitchStep narrates progress for both, not just node switches.
+diff --git a/qt_client/src/MainWindowReleases.cpp b/qt_client/src/MainWindowReleases.cpp
+index eaef6ac5..a37ab863 100644
+--- a/qt_client/src/MainWindowReleases.cpp
++++ b/qt_client/src/MainWindowReleases.cpp
+@@ -1004,7 +1004,7 @@ void MainWindow::loadMirrorNodesPanel()
+     selfAdvert.branch = mirrorHeadBranch(localMirror);
+     selfAdvert.commit = mirrorBranchCommit(localMirror, selfAdvert.branch);
+     selfAdvert.updatedMs = repo.lastSyncMs;
+-    selfAdvert.sizeBytes = mirrorRepoSizeBytes(localMirror);
++    selfAdvert.sizeBytes = cachedMirrorRepoSizeBytes(repo);
+     selfAdvert.issueCount = mirrorIssueCount(localMirror, selfAdvert.branch);
+     selfAdvert.commitCount = mirrorCommitCount(localMirror, selfAdvert.branch);
+     selfAdvert.branchCount = mirrorBranchCount(localMirror);
+diff --git a/qt_client/src/MainWindowRepos.cpp b/qt_client/src/MainWindowRepos.cpp
+index f627f708..8db26cf9 100644
+--- a/qt_client/src/MainWindowRepos.cpp
++++ b/qt_client/src/MainWindowRepos.cpp
+@@ -250,6 +250,50 @@ QStringList MainWindow::mentionCandidateNames() const
+     return names;
+ }
+ 
++qint64 MainWindow::cachedMirrorRepoSizeBytes(const RepositoryRecord &repo,
++                                             bool refreshIfStale)
++{
++    const QString mirrorPath = repo.mirrorPath.trimmed();
++    if (mirrorPath.isEmpty() || !QDir(mirrorPath).exists()) {
++        m_mirrorRepoSizeCache.remove(mirrorPath);
++        m_mirrorRepoSizeRefreshes.remove(mirrorPath);
++        return 0;
++    }
++
++    const qint64 syncMs = repo.lastSyncMs;
++    const auto cached = m_mirrorRepoSizeCache.constFind(mirrorPath);
++    if (cached != m_mirrorRepoSizeCache.cend() && cached->valid &&
++        cached->syncMs == syncMs)
++        return cached->bytes;
++
++    const qint64 fallback =
++        (cached != m_mirrorRepoSizeCache.cend() && cached->valid) ? cached->bytes : 0;
++    if (!refreshIfStale || m_mirrorRepoSizeRefreshes.contains(mirrorPath))
++        return fallback;
++
++    m_mirrorRepoSizeRefreshes.insert(mirrorPath);
++#ifdef FORKMESH_WINDOW_TESTS
++    ++m_testMirrorRepoSizeRefreshes;
++#endif
++    runGitDetached(mirrorPath, {"count-objects", "-v"},
++                   [this, mirrorPath, syncMs](bool ok, const QByteArray &out) {
++                       m_mirrorRepoSizeRefreshes.remove(mirrorPath);
++                       const qint64 bytes =
++                           ok ? parseCountObjectsSizeBytes(out) : 0;
++                       m_mirrorRepoSizeCache.insert(
++                           mirrorPath,
++                           MirrorRepoSizeCacheEntry{syncMs, bytes, true});
++                       m_mirrorAdvertSig.clear();
++                       refreshRepositoryList();
++                       if (m_repoDetailIndex >= 0 &&
++                           m_repoDetailIndex < m_repositories.size() &&
++                           m_repositories.at(m_repoDetailIndex).mirrorPath.trimmed() ==
++                               mirrorPath)
++                           loadMirrorNodesPanel();
++                   });
++    return fallback;
++}
++
+ void MainWindow::refreshRepositoryList()
+ {
+     // Re-entrancy guard (adhoc #247): the periodic m_homeStatsTimer fires this once
+@@ -493,7 +537,7 @@ void MainWindow::refreshRepositoryList()
+             advert.commit = mirrorBranchCommit(repo.mirrorPath, advert.branch);
+             advert.updatedMs = repo.lastSyncMs;
+             // On-disk mirror size so peers can show how much data we're holding.
+-            advert.sizeBytes = mirrorRepoSizeBytes(repo.mirrorPath);
++            advert.sizeBytes = cachedMirrorRepoSizeBytes(repo);
+             // Issues we're mirroring, so peers can show the count per node.
+             advert.issueCount = mirrorIssueCount(repo.mirrorPath, advert.branch);
+             // More tallies the Mirror nodes view shows per node: history depth,
+@@ -2037,7 +2081,7 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+                          // On-disk mirror size so the network page can show how
+                          // much data each owner/repo is hosting. Not signed.
+                          {"sizeBytes",
+-                          QString::number(mirrorRepoSizeBytes(repo.mirrorPath))},
++                          QString::number(cachedMirrorRepoSizeBytes(repo))},
+                          {"visibility", repo.isPrivate
+                                             ? QStringLiteral("private")
+                                             : QStringLiteral("public")},
+@@ -3018,4 +3062,3 @@ void MainWindow::uninstallForkMesh()
+ 
+     QCoreApplication::exit(0);
+ }
+-
+diff --git a/qt_client/tests/test_window_resize.cpp b/qt_client/tests/test_window_resize.cpp
+index 025d803a..f41449d1 100644
+--- a/qt_client/tests/test_window_resize.cpp
++++ b/qt_client/tests/test_window_resize.cpp
+@@ -1113,6 +1113,28 @@ int main(int argc, char *argv[])
+                              "mirror has no agent/looper git dir"));
+     }
+ 
++    // adhoc #77: the mirror-size badge/adverts must not synchronously run
++    // `git count-objects -v` on every GUI refresh. The first call may kick an
++    // async refresh, but unchanged repo state should be served from cache.
++    {
++        QTemporaryDir mirrorDir;
++        const bool madeBare =
++            mirrorDir.isValid() &&
++            runGitChecked(mirrorDir.path(), {"init", "--bare", "-q"});
++        const int mirrorIdx =
++            window.testAddPublishedRepository("someone", "sizerepo", mirrorDir.path());
++        const qint64 first =
++            window.testCachedMirrorRepoSizeBytes(mirrorIdx, true);
++        for (int i = 0; i < 20 && window.testMirrorRepoSizeRefreshes() == 0; ++i)
++            QApplication::processEvents();
++        const qint64 second =
++            window.testCachedMirrorRepoSizeBytes(mirrorIdx, true);
++        check(madeBare && first == 0 && second >= 0 &&
++                  window.testMirrorRepoSizeRefreshes() == 1,
++              QStringLiteral("mirror repo size uses an async cache instead of "
++                             "rerunning count-objects on unchanged GUI refreshes"));
++    }
++
+     // adhoc #38: the issue looper skips issues that are already assigned (a
+     // looper on this or another mirror claimed them) so two loopers never work
+     // the same task, and otherwise picks the highest-priority open issue with no

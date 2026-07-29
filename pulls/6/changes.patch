@@ -1,0 +1,206 @@
+diff --git a/cloudflare_worker/src/entry.py b/cloudflare_worker/src/entry.py
+index d08c0b3e..74b13cf7 100644
+--- a/cloudflare_worker/src/entry.py
++++ b/cloudflare_worker/src/entry.py
+@@ -4632,6 +4632,23 @@ BOUNTY_MAX_USD = 100000.0
+ BOUNTY_TREASURY_BPS = 1000  # 10% to treasury, in basis points
+ 
+ 
++def _bounty_escrow_mode(env):
++    mode = (getattr(env, "BOUNTY_ESCROW_MODE", "") or "custody").strip().lower()
++    return "onchain" if mode == "onchain" else "custody"
++
++
++def _bounty_escrow_cluster(env):
++    cluster = (getattr(env, "BOUNTY_ESCROW_CLUSTER", "") or
++               getattr(env, "SOLANA_CLUSTER", "") or "mainnet-beta").strip().lower()
++    if cluster in ("devnet", "testnet", "mainnet-beta"):
++        return cluster
++    return "mainnet-beta"
++
++
++def _bounty_onchain_legal_reviewed(env):
++    return (getattr(env, "BOUNTY_ESCROW_LEGAL_REVIEWED", "") or "").strip() == "1"
++
++
+ async def _usd_to_lamports(env, usd):
+     price = await _sol_usd_price(env)  # USD per SOL
+     if price <= 0:
+@@ -4654,6 +4671,51 @@ async def _bounty_wallet_bi(env, owner):
+     return await blind_index(env, "bounty-wallet:" + owner)
+ 
+ 
++async def _repo_root_commit_for_bounty(env, owner, repo, supplied=""):
++    supplied = clean_string(supplied, 64)
++    if supplied:
++        return supplied
++    try:
++        repo_bi = await blind_index(env, owner + "/" + repo)
++        row = await d1_first(
++            env, "SELECT data FROM repositories WHERE key_bi=?", repo_bi)
++        rec = await decrypt_row(env, row.get("data", "")) if row else None
++        return clean_string((rec or {}).get("rootCommit", ""), 64)
++    except Exception:
++        return ""
++
++
++async def _bounty_onchain_record(
++        env, owner, repo, number, kind, amount_usd, required_lamports, payee,
++        root_commit):
++    # Devnet-first non-custodial path. The worker returns deterministic program
++    # metadata and never stores an escrow private key; release/refund mechanics
++    # live in the configured Anchor program.
++    program_id = clean_string(getattr(env, "BOUNTY_ESCROW_PROGRAM_ID", ""), 64)
++    if not SOLANA_RE.match(program_id or ""):
++        return None
++    root_commit = clean_string(root_commit, 64)
++    seed = ("forkmesh-bounty-escrow-v1\n" + root_commit + "\n" +
++            (kind or "issue") + "\n" + str(int(number))).encode()
++    digest = await sha256_hex(seed.decode())
++    escrow_pda = _base58_encode(bytes.fromhex(digest)[:32])
++    cluster = _bounty_escrow_cluster(env)
++    return {
++        "owner": owner, "repo": repo, "number": number, "kind": kind,
++        "address": escrow_pda, "secret": "", "escrow_mode": "onchain",
++        "cluster": cluster, "program_id": program_id, "escrow_pda": escrow_pda,
++        "root_commit": root_commit, "amount_usd": amount_usd,
++        "required_lamports": required_lamports, "received_lamports": 0,
++        "confirmed": False, "status": "open", "created_at": int(Date.now()),
++        "payee": payee, "payee_authorized": bool(payee), "payout_sig": "",
++        "release_attestation": {
++            "scheme": "forkmesh-bounty-release-v1",
++            "signer": "repo-owner",
++            "splitBps": {"contributor": 9000, "project": BOUNTY_TREASURY_BPS},
++        },
++    }
++
++
+ async def _load_bounty_wallet(env, wallet_bi):
+     row = await d1_first(
+         env, "SELECT data FROM bounty_wallet WHERE wallet_bi=?", wallet_bi)
+@@ -4702,6 +4764,12 @@ def _bounty_public(rec):
+         "status": rec.get("status", "open"),
+         "payee": rec.get("payee", ""),
+         "payoutSig": rec.get("payout_sig", ""),
++        "escrowMode": rec.get("escrow_mode", "custody"),
++        "cluster": rec.get("cluster", ""),
++        "programId": rec.get("program_id", ""),
++        "escrowPda": rec.get("escrow_pda", ""),
++        "rootCommit": rec.get("root_commit", ""),
++        "releaseAttestation": rec.get("release_attestation", {}),
+         "uri": _solana_pay_uri(
+             rec.get("address", ""), int(rec.get("required_lamports", 0)),
+             message="ForkMesh bounty"),
+@@ -4890,8 +4958,14 @@ async def bounties_handler(env, request, owner, repo):
+         # can't repoint the escrow or reset its amount out from under the transfer.
+         if rec and rec.get("status") in ("paid", "paying"):
+             return json_response({"error": "already_paid"}, status=409)
++        escrow_mode = _bounty_escrow_mode(env)
++        escrow_cluster = _bounty_escrow_cluster(env)
++        # BOUNTY_ESCROW_LEGAL_REVIEWED must be set before mainnet on-chain escrow.
++        if (escrow_mode == "onchain" and escrow_cluster == "mainnet-beta" and
++                not _bounty_onchain_legal_reviewed(env)):
++            return json_response({"error": "legal_review_required"}, status=503)
+         treasury = _treasury_address(env)
+-        if not treasury:
++        if escrow_mode == "custody" and not treasury:
+             return json_response({"error": "treasury_not_configured"}, status=503)
+         try:
+             amount_usd = float(data.get("amountUsd", 0))
+@@ -4937,10 +5011,26 @@ async def bounties_handler(env, request, owner, repo):
+             if cand and SOLANA_RE.match(cand):
+                 payee = cand
+ 
++        if escrow_mode == "onchain" and not data.get("fromWallet"):
++            root_commit = await _repo_root_commit_for_bounty(
++                env, owner, repo, data.get("rootCommit", ""))
++            if not root_commit:
++                return json_response({"error": "root_commit_required"}, status=400)
++            onchain_rec = await _bounty_onchain_record(
++                env, owner, repo, number, kind, amount_usd, required, payee,
++                root_commit)
++            if not onchain_rec:
++                return json_response(
++                    {"error": "escrow_program_not_configured"}, status=503)
++            await _save_bounty(env, bounty_bi, onchain_rec)
++            return json_response(_bounty_public(onchain_rec))
++
+         # Wallet mode (issue #347): instead of minting an escrow for the owner to
+         # fund by hand, debit the owner's pre-funded inbuilt bounty wallet and pay
+         # the split directly — the bounty is settled in one step.
+         if data.get("fromWallet"):
++            if not treasury:
++                return json_response({"error": "treasury_not_configured"}, status=503)
+             if not payee:
+                 return json_response({"error": "payee_unresolved"}, status=400)
+             wallet_bi = await _bounty_wallet_bi(env, owner)
+diff --git a/qt_client/src/MainWindow.h b/qt_client/src/MainWindow.h
+index c066b25f..103bd8b3 100644
+--- a/qt_client/src/MainWindow.h
++++ b/qt_client/src/MainWindow.h
+@@ -141,6 +141,7 @@ struct RepositoryRecord {
+     QString cloneUrl;
+     QString localPath;
+     QString solanaAddress;
++    QString rootCommit;
+     QString mirrorPath;
+     bool publishToNetwork = false;
+     // Private repo: hidden from the public catalog and readable (browse/clone
+diff --git a/qt_client/src/MainWindowPulls.cpp b/qt_client/src/MainWindowPulls.cpp
+index 84425c8e..4bbb5958 100644
+--- a/qt_client/src/MainWindowPulls.cpp
++++ b/qt_client/src/MainWindowPulls.cpp
+@@ -6167,6 +6167,7 @@ void MainWindow::fundBountiesForMergedPull(const PullRequest &pr)
+                                   {"repo", repo.name},
+                                   {"number", number},
+                                   {"amountUsd", amount},
++                                  {"rootCommit", repo.rootCommit},
+                                   {"payeeNode", payeeNode},
+                                   {"ts", ts},
+                                   {"sig", sig}};
+@@ -6256,6 +6257,7 @@ void MainWindow::autoBountyForMergedPull(const PullRequest &pr)
+                               {"number", number},
+                               {"kind", QStringLiteral("pr")},
+                               {"amountUsd", amount},
++                              {"rootCommit", repo.rootCommit},
+                               {"payeeNode", payeeNode},
+                               {"fromWallet", walletMode},
+                               {"ts", ts},
+@@ -7100,4 +7102,3 @@ void MainWindow::pollOwnedInboxes()
+         drainCommitInboxFor(repo, /*interactive=*/false);
+     }
+ }
+-
+diff --git a/qt_client/src/MainWindowRepos.cpp b/qt_client/src/MainWindowRepos.cpp
+index f627f708..36bbb224 100644
+--- a/qt_client/src/MainWindowRepos.cpp
++++ b/qt_client/src/MainWindowRepos.cpp
+@@ -158,6 +158,7 @@ void MainWindow::loadRepositories()
+         repo.cloneUrl = settings.value("cloneUrl").toString();
+         repo.localPath = settings.value("localPath").toString();
+         repo.solanaAddress = settings.value("solanaAddress").toString();
++        repo.rootCommit = settings.value("rootCommit").toString();
+         repo.mirrorPath = settings.value("mirrorPath").toString();
+         repo.publishToNetwork = settings.value("publishToNetwork").toBool();
+         repo.isPrivate = settings.value("isPrivate").toBool();
+@@ -200,6 +201,7 @@ void MainWindow::saveRepositories() const
+         settings.setValue("cloneUrl", repo.cloneUrl);
+         settings.setValue("localPath", repo.localPath);
+         settings.setValue("solanaAddress", repo.solanaAddress);
++        settings.setValue("rootCommit", repo.rootCommit);
+         settings.setValue("mirrorPath", repo.mirrorPath);
+         settings.setValue("publishToNetwork", repo.publishToNetwork);
+         settings.setValue("isPrivate", repo.isPrivate);
+@@ -1943,6 +1945,7 @@ void MainWindow::publishRepository(int index, bool showDialogOnError)
+         if (rootCommit.isEmpty())
+             rootCommit = firstRoot({"rev-list", "--max-parents=0", "--all"});
+     }
++    repo.rootCommit = rootCommit;
+     // Owner-signed fingerprint of the refs this node serves (sha256 over the
+     // canonical heads+tags advertisement). The relay pins this and refuses to
+     // serve any mirror whose live advertisement doesn't hash to it, so a tampered
+@@ -3018,4 +3021,3 @@ void MainWindow::uninstallForkMesh()
+ 
+     QCoreApplication::exit(0);
+ }
+-

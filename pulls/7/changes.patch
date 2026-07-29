@@ -1,0 +1,1386 @@
+diff --git a/cloudflare_worker/public/dashboard/js/06-repo-content.js b/cloudflare_worker/public/dashboard/js/06-repo-content.js
+index ac8f3e4c..8feab8cc 100644
+--- a/cloudflare_worker/public/dashboard/js/06-repo-content.js
++++ b/cloudflare_worker/public/dashboard/js/06-repo-content.js
+@@ -202,7 +202,8 @@
+     issues: {
+       label: "Issues",
+       itemLabel: "issue",
+-      dir: "issues", file: "issue.md",
++      dir: ".forkmesh/issues", file: (entry) => `issue-${Number(entry.name)}.json`,
++      json: true,
+       icon: "circle-dot",
+       tone: "text-primary",
+       empty: "No issues have been committed to this mirror yet.",
+@@ -281,14 +282,20 @@
+       .sort((a, b) => Number(b.name) - Number(a.name))
+       .slice(0, 50);
+     // One batched request for every record file instead of a per-record fan-out.
+-    const blobs = await fetchRepoBlobs(
+-      repo, dirs.map((entry) => `${config.dir}/${entry.name}/${config.file}`));
++    const recordPath = (entry) =>
++      `${config.dir}/${entry.name}/${typeof config.file === "function" ? config.file(entry) : config.file}`;
++    const blobs = await fetchRepoBlobs(repo, dirs.map(recordPath));
+     const records = dirs.map((entry) => {
+       const number = Number(entry.name);
+-      const blob = blobs[`${config.dir}/${entry.name}/${config.file}`];
++      const blob = blobs[recordPath(entry)];
+       if (!blob) return null;
+-      const parsed = parseFrontMatter(blobText(blob));
++      const text = blobText(blob);
++      const issue = config.json ? JSON.parse(text) : null;
++      const parsed = config.json ? { values: issue, body: "" } : parseFrontMatter(text);
+       const values = parsed.values || {};
++      const body = config.json
++        ? (Array.isArray(issue.events) ? issue.events.map((event) => event.body || "").join("\n\n") : "")
++        : (parsed.body || "");
+       return {
+         number,
+         title: values.title || `${config.itemLabel} #${number}`,
+@@ -296,8 +303,8 @@
+         author: values.authorName || values.author || "unknown",
+         date: formatRecordDate(values.updatedAt || values.createdAt || values.ts),
+         meta: config.meta(values),
+-        body: parsed.body || "",
+-        wantsAgent: config.dir === "issues" ? Boolean(values.wantsAgent) : false,
++        body,
++        wantsAgent: config.json ? Boolean(values.wantsAgent) : false,
+       };
+     });
+     return records.filter(Boolean);
+@@ -825,9 +832,9 @@
+     try {
+       let tree;
+       try {
+-        // List the git tree under issues/ (the mirror browse endpoint
+-        // /tree?path=issues) then read one issues/${number}/issue.md blob each.
+-        tree = await fetchRepoJson(repoLiveUrl(repo, "tree", { path: "issues" }));
++        // List the git tree under .forkmesh/issues, then read one
++        // .forkmesh/issues/${number}/issue-${number}.json blob each.
++        tree = await fetchRepoJson(repoLiveUrl(repo, "tree", { path: ".forkmesh/issues" }));
+       } catch (error) {
+         if (isMissingMirrorFolder(error)) {
+           state.issuesView.items = [];
+@@ -843,13 +850,15 @@
+         .slice(0, 50);
+       // One batched request for all of them, not one /blob call per issue.
+       const blobs = await fetchRepoBlobs(
+-        repo, dirs.map((entry) => `issues/${Number(entry.name)}/issue.md`));
++        repo, dirs.map((entry) => {
++          const number = Number(entry.name);
++          return `.forkmesh/issues/${number}/issue-${number}.json`;
++        }));
+       const items = dirs.map((entry) => {
+         const number = Number(entry.name);
+-        const blob = blobs[`issues/${number}/issue.md`];
++        const blob = blobs[`.forkmesh/issues/${number}/issue-${number}.json`];
+         if (!blob) return null;
+-        const parsed = parseFrontMatter(blobText(blob));
+-        const values = parsed.values || {};
++        const values = JSON.parse(blobText(blob));
+         return {
+           number,
+           title: values.title || `issue #${number}`,
+@@ -857,7 +866,9 @@
+           author: values.authorName || values.author || "unknown",
+           date: formatRecordDate(values.updatedAt || values.createdAt || values.ts),
+           meta: repoCollectionConfig.issues.meta(values),
+-          body: parsed.body || "",
++          body: Array.isArray(values.events)
++            ? values.events.map((event) => event.body || "").join("\n\n")
++            : "",
+           wantsAgent: Boolean(values.wantsAgent),
+         };
+       }).filter(Boolean);
+@@ -868,7 +879,7 @@
+       setRepoCollectionCounts("issues", openIssues, items.length - openIssues);
+       renderRepoIssues();
+     } catch (_) {
+-      container.innerHTML = '<div class="px-4 py-3 text-sm text-muted-foreground">Issues are unavailable until a live desktop host serves the issues/ folder.</div>';
++      container.innerHTML = '<div class="px-4 py-3 text-sm text-muted-foreground">Issues are unavailable until a live desktop host serves the .forkmesh/issues/ folder.</div>';
+     }
+   }
+ 
+@@ -1338,4 +1349,3 @@
+       if (submit) submit.disabled = false;
+     }
+   }
+-
+diff --git a/cloudflare_worker/tests/test_dashboard_landing_migration.py b/cloudflare_worker/tests/test_dashboard_landing_migration.py
+index 2774f283..e3f34376 100644
+--- a/cloudflare_worker/tests/test_dashboard_landing_migration.py
++++ b/cloudflare_worker/tests/test_dashboard_landing_migration.py
+@@ -431,7 +431,7 @@ def test_dashboard_repository_tabs_read_public_mirror_data_not_owner_inbox():
+         # discussions read it lazily through loadRepoCollection on tab view.
+         "loadRepoIssues(repo)",
+         "loadRepoCollection(state.selectedRepo, tab,",
+-        'dir: "issues", file: "issue.md"',
++        'dir: ".forkmesh/issues", file: (entry) => `issue-${Number(entry.name)}.json`',
+         'dir: "pulls", file: "pull.md"',
+         'dir: "discussions", file: "discussion.md"',
+         "fetchRepoJson(repoLiveUrl(repo, \"tree\", { path: config.dir }))",
+diff --git a/cloudflare_worker/tests/test_issue_filter_frontend.py b/cloudflare_worker/tests/test_issue_filter_frontend.py
+index 403776c7..7b8724a2 100644
+--- a/cloudflare_worker/tests/test_issue_filter_frontend.py
++++ b/cloudflare_worker/tests/test_issue_filter_frontend.py
+@@ -71,8 +71,9 @@ def test_dashboard_js_loads_issues_from_git_tree_and_counts_open():
+         DASHBOARD_JS.index("async function loadRepoIssues")
+         : DASHBOARD_JS.index("async function loadRepoCollection")
+     ]
+-    # Published issues come from the repo's issues/ git folder, not the inbox.
+-    assert "/tree?path=" in load and "issues/${number}/issue.md" in load
++    # Published issues come from the repo's .forkmesh/issues/ git folder, not the inbox.
++    assert 'path: ".forkmesh/issues"' in load
++    assert "`.forkmesh/issues/${number}/issue-${number}.json`" in load
+     # The default Open view is rendered through the filter, and the tab badge
+     # counts the open issues.
+     assert 'issuesView.filter = "open";' in load
+@@ -97,7 +98,7 @@ def test_homepage_links_to_active_nodes():
+ 
+ 
+ def test_dashboard_js_batches_record_reads_and_lazy_loads_tabs():
+-    # Record lists (issues/pulls/discussions) must fetch their markdown files
++    # Record lists (issue JSON plus pull/discussion markdown) must fetch their files
+     # through ONE batched /blobs request — fetching each record as its own
+     # /blob call fired 50+ parallel requests per page view and tripped the
+     # relay's per-repo rate limit — and must only load on the tab's FIRST
+diff --git a/flutter_app/lib/services/api_service.dart b/flutter_app/lib/services/api_service.dart
+index 7bc1dcd7..ccaecd14 100644
+--- a/flutter_app/lib/services/api_service.dart
++++ b/flutter_app/lib/services/api_service.dart
+@@ -192,13 +192,26 @@ class ApiService {
+   Future<List<Issue>> publishedIssues(String owner, String name) {
+     final key = '$owner/$name';
+     return _cached(_issuesCache, key, () async {
+-      final dirs = await _numberedFolders(owner, name, 'issues');
++      var dirs = await _numberedFolders(owner, name, '.forkmesh/issues');
++      var legacy = false;
++      if (dirs.isEmpty) {
++        dirs = await _numberedFolders(owner, name, 'issues');
++        legacy = true;
++      }
+       final items = await Future.wait(
+         dirs.map((dir) async {
+           try {
+-            final b = await blob(owner, name, 'issues/$dir/issue.md');
+-            final events = await _issueEvents(owner, name, dir);
+-            return _issueFromMarkdown(dir, b.content, events: events);
++            if (legacy) {
++              final b = await blob(owner, name, 'issues/$dir/issue.md');
++              final events = await _issueEvents(owner, name, dir);
++              return _issueFromMarkdown(dir, b.content, events: events);
++            }
++            final b = await blob(
++              owner,
++              name,
++              '.forkmesh/issues/$dir/issue-$dir.json',
++            );
++            return _issueFromJson(dir, b.content);
+           } catch (_) {
+             return null;
+           }
+@@ -209,6 +222,29 @@ class ApiService {
+     });
+   }
+ 
++  Issue _issueFromJson(String number, String text) {
++    final data = jsonDecode(text) as Map<String, dynamic>;
++    final issue = Issue.fromJson(data);
++    final events = issue.events;
++    final body = events
++        .where((e) => e.type == 'open')
++        .map((e) => e.body)
++        .where((body) => body.isNotEmpty)
++        .firstWhere((_) => true, orElse: () => '');
++    final author = (data['authorName'] ?? data['author'] ?? '').toString();
++    return Issue(
++      number: issue.number == 0 ? int.tryParse(number) ?? 0 : issue.number,
++      title: issue.title.isEmpty ? 'Issue #$number' : issue.title,
++      status: issue.status,
++      body: body.isEmpty ? issue.body : body,
++      author: author,
++      labels: issue.labels,
++      events: events,
++      votes: issue.votes,
++      bountyUsd: issue.bountyUsd,
++    );
++  }
++
+   Future<List<IssueEvent>> _issueEvents(
+     String owner,
+     String name,
+diff --git a/ide_extension/package.json b/ide_extension/package.json
+index 40209334..171e7ab2 100644
+--- a/ide_extension/package.json
++++ b/ide_extension/package.json
+@@ -52,7 +52,7 @@
+     "viewsWelcome": [
+       {
+         "view": "forkmeshIssues",
+-        "contents": "No ForkMesh issues found in this workspace.\nOpen a folder that contains an `issues/` directory (a ForkMesh repository), or set the issues path.\n[Set issues path](command:forkmesh.openSettings)"
++        "contents": "No ForkMesh issues found in this workspace.\nOpen a folder that contains a `.forkmesh/issues/` directory (a ForkMesh repository), or set the issues path.\n[Set issues path](command:forkmesh.openSettings)"
+       }
+     ],
+     "commands": [
+@@ -144,7 +144,7 @@
+         "forkmesh.issuesPath": {
+           "type": "string",
+           "default": "",
+-          "markdownDescription": "Optional absolute path to a ForkMesh `issues/` directory. Leave empty to auto-detect `<workspaceFolder>/issues`."
++          "markdownDescription": "Optional absolute path to a ForkMesh `.forkmesh/issues/` directory. Leave empty to auto-detect `<workspaceFolder>/.forkmesh/issues`."
+         },
+         "forkmesh.showClosedIssues": {
+           "type": "boolean",
+diff --git a/ide_extension/src/extension.ts b/ide_extension/src/extension.ts
+index 875db46e..4126e12d 100644
+--- a/ide_extension/src/extension.ts
++++ b/ide_extension/src/extension.ts
+@@ -115,10 +115,17 @@ export function activate(context: vscode.ExtensionContext): void {
+ 
+   // Refresh the tree whenever issue files change on disk.
+   const watcher = vscode.workspace.createFileSystemWatcher("**/issues/**");
++  const forkmeshWatcher = vscode.workspace.createFileSystemWatcher(
++    "**/.forkmesh/issues/**"
++  );
+   watcher.onDidCreate(() => provider.refresh());
+   watcher.onDidChange(() => provider.refresh());
+   watcher.onDidDelete(() => provider.refresh());
++  forkmeshWatcher.onDidCreate(() => provider.refresh());
++  forkmeshWatcher.onDidChange(() => provider.refresh());
++  forkmeshWatcher.onDidDelete(() => provider.refresh());
+   context.subscriptions.push(watcher);
++  context.subscriptions.push(forkmeshWatcher);
+   context.subscriptions.push(
+     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refresh()),
+     vscode.workspace.onDidChangeConfiguration((e) => {
+diff --git a/ide_extension/src/issues.ts b/ide_extension/src/issues.ts
+index 137ec99f..74c60c46 100644
+--- a/ide_extension/src/issues.ts
++++ b/ide_extension/src/issues.ts
+@@ -1,6 +1,6 @@
+-// Parse ForkMesh's file-based issue tracker (see issues/README.md):
+-//   issues/<N>/issue.md          frontmatter (metadata + open event) + body
+-//   issues/<N>/NNNN-status.md     append-only later events (status changes, ...)
++// Parse ForkMesh's file-based issue tracker:
++//   .forkmesh/issues/<N>/issue-<N>.json
++//   legacy: issues/<N>/issue.md plus NNNN-*.md event files
+ //
+ // We only need a light read here: title, current status, labels and the body,
+ // so a small frontmatter parser is enough — no need to verify signatures.
+@@ -15,8 +15,8 @@ export interface ForkMeshIssue {
+   priority: number;
+   assignees: string[];
+   body: string;
+-  issueFile: string; // absolute path to issue.md
+-  repoRoot: string; // the directory containing issues/
++  issueFile: string; // absolute path to issue-<N>.json or legacy issue.md
++  repoRoot: string;
+ }
+ 
+ interface Frontmatter {
+@@ -24,6 +24,13 @@ interface Frontmatter {
+   body: string;
+ }
+ 
++interface IssueJsonEvent {
++  type?: string;
++  title?: string;
++  body?: string;
++  status?: string;
++}
++
+ function parseFrontmatter(text: string): Frontmatter {
+   const fields: Record<string, string> = {};
+   if (!text.startsWith("---")) {
+@@ -94,6 +101,32 @@ function currentStatus(issueDir: string, fallback: string): string {
+ 
+ function readIssue(issuesDir: string, repoRoot: string, dirName: string): ForkMeshIssue | undefined {
+   const issueDir = path.join(issuesDir, dirName);
++  const jsonFile = path.join(issueDir, `issue-${dirName}.json`);
++  try {
++    const data = JSON.parse(fs.readFileSync(jsonFile, "utf8"));
++    const number = Number(data.number ?? dirName);
++    if (!Number.isFinite(number)) {
++      return undefined;
++    }
++    const events: IssueJsonEvent[] = Array.isArray(data.events) ? data.events : [];
++    const open = events.find((ev) => ev?.type === "open");
++    const latestStatus = [...events]
++      .reverse()
++      .find((ev) => ev?.type === "status" && typeof ev.status === "string");
++    return {
++      number,
++      title: data.title || open?.title || `Issue ${number}`,
++      status: latestStatus?.status || data.status || "open",
++      labels: Array.isArray(data.labels) ? data.labels.map(String) : [],
++      priority: Number(data.priority) || 0,
++      assignees: Array.isArray(data.assignees) ? data.assignees.map(String) : [],
++      body: typeof open?.body === "string" ? open.body : "",
++      issueFile: jsonFile,
++      repoRoot,
++    };
++  } catch {
++    /* fall through to legacy issue.md */
++  }
+   const issueFile = path.join(issueDir, "issue.md");
+   let text: string;
+   try {
+@@ -119,28 +152,34 @@ function readIssue(issuesDir: string, repoRoot: string, dirName: string): ForkMe
+   };
+ }
+ 
+-// Locate the issues directory: an explicit override, else <root>/issues for the
+-// first workspace root that has one.
++function repoRootForIssuesDir(issuesDir: string): string {
++  const parent = path.dirname(issuesDir);
++  return path.basename(parent) === ".forkmesh" ? path.dirname(parent) : parent;
++}
++
++// Locate the issues directory: an explicit override, else .forkmesh/issues for
++// the first workspace root that has one, with legacy issues/ fallback.
+ export function findIssuesDir(roots: string[], override: string): string | undefined {
+   if (override && override.trim()) {
+     const dir = override.trim();
+     return fs.existsSync(dir) ? dir : undefined;
+   }
+   for (const root of roots) {
+-    const dir = path.join(root, "issues");
+-    try {
+-      if (fs.statSync(dir).isDirectory()) {
+-        return dir;
++    for (const dir of [path.join(root, ".forkmesh", "issues"), path.join(root, "issues")]) {
++      try {
++        if (fs.statSync(dir).isDirectory()) {
++          return dir;
++        }
++      } catch {
++        /* keep looking */
+       }
+-    } catch {
+-      /* keep looking */
+     }
+   }
+   return undefined;
+ }
+ 
+ export function loadIssues(issuesDir: string, includeClosed: boolean): ForkMeshIssue[] {
+-  const repoRoot = path.dirname(issuesDir);
++  const repoRoot = repoRootForIssuesDir(issuesDir);
+   let entries: string[] = [];
+   try {
+     entries = fs.readdirSync(issuesDir);
+@@ -172,5 +211,8 @@ export function loadIssues(issuesDir: string, includeClosed: boolean): ForkMeshI
+ 
+ // Read a single issue by number from a known repo root (used for Qt requests).
+ export function loadIssueByNumber(repoRoot: string, n: number): ForkMeshIssue | undefined {
+-  return readIssue(path.join(repoRoot, "issues"), repoRoot, String(n));
++  return (
++    readIssue(path.join(repoRoot, ".forkmesh", "issues"), repoRoot, String(n)) ||
++    readIssue(path.join(repoRoot, "issues"), repoRoot, String(n))
++  );
+ }
+diff --git a/qt_client/src/IssueStore.cpp b/qt_client/src/IssueStore.cpp
+index f3aceeec..5753223f 100644
+--- a/qt_client/src/IssueStore.cpp
++++ b/qt_client/src/IssueStore.cpp
+@@ -24,6 +24,8 @@ namespace {
+ 
+ constexpr int kGitTimeoutMs = 10000;
+ constexpr int kGitRewriteTimeoutMs = 120000;
++const QString kIssuesRoot = QStringLiteral(".forkmesh/issues");
++const QString kLegacyIssuesRoot = QStringLiteral("issues");
+ 
+ // Run git in `dir`, capturing stdout. Returns false (with optional error text)
+ // on non-zero exit or timeout. Mirrors RepoHost's helper.
+@@ -228,6 +230,21 @@ const QRegularExpression &eventFileRe()
+     return re;
+ }
+ 
++QString issueJsonName(int number)
++{
++    return QStringLiteral("issue-%1.json").arg(number);
++}
++
++QString legacyIssuesDir(const QString &workTree)
++{
++    return workTree + "/" + kLegacyIssuesRoot;
++}
++
++QString legacyIssueDir(const QString &workTree, int number)
++{
++    return legacyIssuesDir(workTree) + "/" + QString::number(number);
++}
++
+ QString pendingAttachmentPlaceholder(int index)
+ {
+     return QStringLiteral("forkmesh-pending-image:%1").arg(index);
+@@ -290,8 +307,10 @@ QJsonObject IssueEvent::toJson() const
+                     {"ts", double(ts)}};
+     if (type == "open" || type == "title")
+         obj.insert("title", title);
+-    if (type == "open" || type == "comment" || type == "edit")
++    if (type == "open" || type == "comment" || type == "edit") {
++        obj.insert("body", body);
+         obj.insert("attachments", fromStringList(attachments));
++    }
+     if (type == "edit" || type == "delete")
+         obj.insert("target", target);
+     if (type == "status")
+@@ -330,6 +349,7 @@ IssueEvent IssueEvent::fromJson(const QJsonObject &obj)
+     ev.authorName = obj.value("authorName").toString();
+     ev.ts = qint64(obj.value("ts").toDouble());
+     ev.title = obj.value("title").toString();
++    ev.body = obj.value("body").toString();
+     ev.attachments = toStringList(obj.value("attachments").toArray());
+     ev.target = obj.value("target").toString();
+     ev.status = obj.value("status").toString();
+@@ -412,7 +432,7 @@ bool IssueStore::canWrite() const
+     return QFileInfo::exists(m_workTree + "/.git");
+ }
+ 
+-QString IssueStore::issuesDir() const { return m_workTree + "/issues"; }
++QString IssueStore::issuesDir() const { return m_workTree + "/" + kIssuesRoot; }
+ 
+ QString IssueStore::issueDir(int number) const
+ {
+@@ -565,21 +585,28 @@ QList<Issue> IssueStore::loadAll(QString *error, const std::function<void()> &ti
+         return loadFromMirror(error);
+ 
+     QList<Issue> issues;
+-    const QStringList entries =
+-        QDir(issuesDir()).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+-    for (const QString &entry : entries) {
+-        bool numeric = false;
+-        const int number = entry.toInt(&numeric);
+-        if (!numeric)
+-            continue;
+-        Issue issue;
+-        if (readIssueFile(number, issue) && !issue.isDeleted())
+-            issues.append(issue);
+-        // readIssueFile opens issue.md plus every event file; across a big repo
+-        // (hundreds of issues, thousands of files) this loop blocks the GUI long
+-        // enough to trip the stall watchdog. Let an interactive caller pump.
+-        if (tick)
+-            tick();
++    QSet<int> seen;
++    const QStringList roots{issuesDir(), legacyIssuesDir(m_workTree)};
++    for (const QString &root : roots) {
++        const QStringList entries =
++            QDir(root).entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
++        for (const QString &entry : entries) {
++            bool numeric = false;
++            const int number = entry.toInt(&numeric);
++            if (!numeric || seen.contains(number))
++                continue;
++            Issue issue;
++            if (readIssueFile(number, issue)) {
++                seen.insert(number);
++                if (!issue.isDeleted())
++                    issues.append(issue);
++            }
++            // readIssueFile may open the issue JSON plus legacy event files; across
++            // a big repo this loop can block the GUI long enough to trip the stall
++            // watchdog. Let an interactive caller pump.
++            if (tick)
++                tick();
++        }
+     }
+     std::sort(issues.begin(), issues.end(),
+               [](const Issue &a, const Issue &b) { return a.number < b.number; });
+@@ -588,30 +615,44 @@ QList<Issue> IssueStore::loadAll(QString *error, const std::function<void()> &ti
+ 
+ QString IssueStore::contentSignature() const
+ {
+-    // Resolve the issues/ subtree to its git object id. The oid is a content hash
++    // Resolve the issues subtree to its git object id. The oid is a content hash
+     // of the whole subtree, so it moves iff some issue/event/label/milestone file
+     // changed — exactly when a reload would surface something new. A writable store
+-    // commits every mutation (createIssue / applyRemoteEvent / set*), so HEAD:issues
+-    // matches the on-disk issues/ that loadAll() reads there; the mirror case reads
+-    // the same ref it loads blobs from.
++    // commits every mutation (createIssue / applyRemoteEvent / set*), so HEAD's
++    // tree matches the on-disk issue data that loadAll() reads there; the mirror
++    // case reads the same ref it loads blobs from.
+     const QString dir = canWrite() ? m_workTree : m_mirror;
+     if (dir.isEmpty())
+         return QString();
+     const QString ref = canWrite() ? QStringLiteral("HEAD") : mirrorRef();
+     if (ref.isEmpty())
+         return QString();
+-    // -q + non-zero exit when issues/ doesn't exist yet (no issues): we ignore the
+-    // bool and fold the empty oid into a stable "no issues" signature.
+     QByteArray oid;
+-    runGit(dir, {"rev-parse", "--verify", "-q", ref + QStringLiteral(":issues")}, &oid);
++    runGit(dir, {"rev-parse", "--verify", "-q", ref + ":" + kIssuesRoot}, &oid);
++    QByteArray legacyOid;
++    runGit(dir, {"rev-parse", "--verify", "-q", ref + ":" + kLegacyIssuesRoot},
++           &legacyOid);
+     // Prefix with the source path so two repos with no issues (both empty oid) — or
+     // a coincidental oid match — can't be mistaken for "unchanged" across a switch.
+-    return dir + QLatin1Char('\n') + QString::fromUtf8(oid).trimmed();
++    return dir + QLatin1Char('\n') + QString::fromUtf8(oid).trimmed() +
++           QLatin1Char('\n') + QString::fromUtf8(legacyOid).trimmed();
+ }
+ 
+ bool IssueStore::readIssueFile(int number, Issue &out) const
+ {
+-    QFile file(issueDir(number) + "/issue.md");
++    QFile jsonFile(issueDir(number) + "/" + issueJsonName(number));
++    if (jsonFile.open(QIODevice::ReadOnly)) {
++        const QJsonObject obj = QJsonDocument::fromJson(jsonFile.readAll()).object();
++        if (obj.value("schema").toString() != QLatin1String("forkmesh-issue-v1"))
++            return false;
++        out = Issue::fromJson(obj);
++        if (out.number == 0)
++            out.number = number;
++        recomputeMetadata(out);
++        return true;
++    }
++
++    QFile file(legacyIssueDir(m_workTree, number) + "/issue.md");
+     if (!file.open(QIODevice::ReadOnly))
+         return false;
+     const FrontMatter fm = parseFrontMatter(file.readAll());
+@@ -639,11 +680,11 @@ bool IssueStore::readIssueFile(int number, Issue &out) const
+ 
+     // Subsequent events: NNNN-<type>.md, in filename (chronological) order.
+     QStringList eventFiles =
+-        QDir(issueDir(number)).entryList(QDir::Files, QDir::Name);
++        QDir(legacyIssueDir(m_workTree, number)).entryList(QDir::Files, QDir::Name);
+     for (const QString &name : eventFiles) {
+         if (!eventFileRe().match(name).hasMatch())
+             continue;
+-        QFile ef(issueDir(number) + "/" + name);
++        QFile ef(legacyIssueDir(m_workTree, number) + "/" + name);
+         if (ef.open(QIODevice::ReadOnly))
+             out.events.append(eventFromFrontMatter(parseFrontMatter(ef.readAll())));
+     }
+@@ -698,17 +739,20 @@ QList<Issue> IssueStore::loadFromMirror(QString *error) const
+     if (ref.isEmpty())
+         return issues;
+ 
+-    // Read the whole issues/ subtree in one recursive listing, then fetch every
++    // Read the whole issues subtree in one recursive listing, then fetch every
+     // needed blob in a single `git cat-file --batch`. The old code spawned a
+     // `git show` per file (plus a per-issue `ls-tree`), which stalled the GUI
+     // thread for seconds on repos with many issues/events.
+     QByteArray listing;
+-    if (!runGit(m_mirror, {"ls-tree", "-r", ref, "issues/"}, &listing))
+-        return issues;
++    runGit(m_mirror, {"ls-tree", "-r", ref, kIssuesRoot + "/"}, &listing);
++    QByteArray legacyListing;
++    runGit(m_mirror, {"ls-tree", "-r", ref, kLegacyIssuesRoot + "/"}, &legacyListing);
++    listing += legacyListing;
+ 
+     struct MirrorIssue {
+-        QString issueOid;                          // blob oid of issue.md
+-        QList<QPair<QString, QString>> eventBlobs; // (filename, oid)
++        QString issueOid;                          // blob oid of issue-#.json/issue.md
++        QString issueFileName;
++        QList<QPair<QString, QString>> eventBlobs; // legacy (filename, oid)
+     };
+     QMap<int, MirrorIssue> byNumber; // keyed (and thus sorted) by issue number
+     QSet<QString> wantedOids;
+@@ -721,9 +765,18 @@ QList<Issue> IssueStore::loadFromMirror(QString *error) const
+         if (meta.size() < 3 || meta.at(1) != QStringLiteral("blob"))
+             continue;
+         const QString oid = meta.at(2);
+-        // path is "issues/<n>/<file>"; ignore top-level files (labels.json …)
+-        // and anything nested deeper (attachments/…).
+-        const QString rel = line.mid(tab + 1).section('/', 1); // strip "issues/"
++        // path is ".forkmesh/issues/<n>/<file>" or legacy "issues/<n>/<file>";
++        // ignore top-level files (labels.json …) and anything nested deeper.
++        const QString path = line.mid(tab + 1);
++        QString rel;
++        const bool legacy = path.startsWith(kLegacyIssuesRoot + "/");
++        if (path.startsWith(kIssuesRoot + "/")) {
++            rel = path.mid(kIssuesRoot.size() + 1);
++        } else if (legacy) {
++            rel = path.mid(kLegacyIssuesRoot.size() + 1);
++        } else {
++            continue;
++        }
+         const int slash = rel.indexOf('/');
+         if (slash < 0)
+             continue;
+@@ -734,10 +787,16 @@ QList<Issue> IssueStore::loadFromMirror(QString *error) const
+         const QString fname = rel.mid(slash + 1);
+         if (fname.contains('/'))
+             continue;
+-        if (fname == QStringLiteral("issue.md")) {
++        const bool haveNewFormat =
++            byNumber.contains(number) &&
++            byNumber.value(number).issueFileName == issueJsonName(number);
++        if (legacy && haveNewFormat)
++            continue;
++        if (fname == issueJsonName(number) || fname == QStringLiteral("issue.md")) {
+             byNumber[number].issueOid = oid;
++            byNumber[number].issueFileName = fname;
+             wantedOids.insert(oid);
+-        } else if (eventFileRe().match(fname).hasMatch()) {
++        } else if (legacy && eventFileRe().match(fname).hasMatch()) {
+             byNumber[number].eventBlobs.append({fname, oid});
+             wantedOids.insert(oid);
+         }
+@@ -776,37 +835,49 @@ QList<Issue> IssueStore::loadFromMirror(QString *error) const
+         const MirrorIssue &files = it.value();
+         if (files.issueOid.isEmpty() || !contentByOid.contains(files.issueOid))
+             continue;
+-        const FrontMatter fm = parseFrontMatter(contentByOid.value(files.issueOid));
+         Issue issue;
+-        issue.number = it.key();
+-        issue.title = fm.get("title");
+-        issue.status = fm.values.contains("status") ? fm.get("status")
+-                                                    : QStringLiteral("open");
+-        issue.labels = fm.list("labels");
+-        issue.milestone = fm.get("milestone");
+-        issue.priority = int(fm.num("priority"));
+-        issue.progress = int(fm.num("progress"));
+-        issue.assignees = fm.list("assignees");
+-        issue.createdAt = fm.num("createdAt");
+-        issue.author = fm.get("author");
+-        issue.authorName = fm.get("authorName");
+-        issue.bountyUsd = fm.dbl("bountyUsd");
+-        issue.bountyAddress = fm.get("bountyAddress");
+-        issue.bountyStatus = fm.get("bountyStatus");
+-        IssueEvent open = eventFromFrontMatter(fm);
+-        open.type = "open";
+-        open.title = issue.title;
+-        issue.events.append(open);
+-
+-        // Subsequent events in filename (chronological) order.
+-        QList<QPair<QString, QString>> events = files.eventBlobs;
+-        std::sort(events.begin(), events.end(),
+-                  [](const QPair<QString, QString> &a,
+-                     const QPair<QString, QString> &b) { return a.first < b.first; });
+-        for (const QPair<QString, QString> &ev : events) {
+-            if (contentByOid.contains(ev.second))
+-                issue.events.append(
+-                    eventFromFrontMatter(parseFrontMatter(contentByOid.value(ev.second))));
++        if (files.issueFileName == issueJsonName(it.key())) {
++            const QJsonObject obj =
++                QJsonDocument::fromJson(contentByOid.value(files.issueOid)).object();
++            if (obj.value("schema").toString() != QLatin1String("forkmesh-issue-v1"))
++                continue;
++            issue = Issue::fromJson(obj);
++            if (issue.number == 0)
++                issue.number = it.key();
++        } else {
++            const FrontMatter fm = parseFrontMatter(contentByOid.value(files.issueOid));
++            issue.number = it.key();
++            issue.title = fm.get("title");
++            issue.status = fm.values.contains("status") ? fm.get("status")
++                                                        : QStringLiteral("open");
++            issue.labels = fm.list("labels");
++            issue.milestone = fm.get("milestone");
++            issue.priority = int(fm.num("priority"));
++            issue.progress = int(fm.num("progress"));
++            issue.assignees = fm.list("assignees");
++            issue.createdAt = fm.num("createdAt");
++            issue.author = fm.get("author");
++            issue.authorName = fm.get("authorName");
++            issue.bountyUsd = fm.dbl("bountyUsd");
++            issue.bountyAddress = fm.get("bountyAddress");
++            issue.bountyStatus = fm.get("bountyStatus");
++            IssueEvent open = eventFromFrontMatter(fm);
++            open.type = "open";
++            open.title = issue.title;
++            issue.events.append(open);
++
++            // Subsequent events in filename (chronological) order.
++            QList<QPair<QString, QString>> events = files.eventBlobs;
++            std::sort(events.begin(), events.end(),
++                      [](const QPair<QString, QString> &a,
++                         const QPair<QString, QString> &b) {
++                          return a.first < b.first;
++                      });
++            for (const QPair<QString, QString> &ev : events) {
++                if (contentByOid.contains(ev.second))
++                    issue.events.append(eventFromFrontMatter(
++                        parseFrontMatter(contentByOid.value(ev.second))));
++            }
+         }
+         recomputeMetadata(issue); // tally votes (and fold event metadata)
+         if (!issue.isDeleted())
+@@ -823,9 +894,16 @@ QList<IssueLabel> IssueStore::loadLabels() const
+         QFile file(issuesDir() + "/labels.json");
+         if (file.open(QIODevice::ReadOnly))
+             bytes = file.readAll();
++        else {
++            QFile legacy(legacyIssuesDir(m_workTree) + "/labels.json");
++            if (legacy.open(QIODevice::ReadOnly))
++                bytes = legacy.readAll();
++        }
+     } else {
+         bool ok = false;
+-        bytes = showFromMirror("issues/labels.json", &ok);
++        bytes = showFromMirror(kIssuesRoot + "/labels.json", &ok);
++        if (!ok)
++            bytes = showFromMirror(kLegacyIssuesRoot + "/labels.json", &ok);
+     }
+     QList<IssueLabel> labels;
+     for (const QJsonValue &value : QJsonDocument::fromJson(bytes).array()) {
+@@ -842,9 +920,16 @@ QList<IssueMilestone> IssueStore::loadMilestones() const
+         QFile file(issuesDir() + "/milestones.json");
+         if (file.open(QIODevice::ReadOnly))
+             bytes = file.readAll();
++        else {
++            QFile legacy(legacyIssuesDir(m_workTree) + "/milestones.json");
++            if (legacy.open(QIODevice::ReadOnly))
++                bytes = legacy.readAll();
++        }
+     } else {
+         bool ok = false;
+-        bytes = showFromMirror("issues/milestones.json", &ok);
++        bytes = showFromMirror(kIssuesRoot + "/milestones.json", &ok);
++        if (!ok)
++            bytes = showFromMirror(kLegacyIssuesRoot + "/milestones.json", &ok);
+     }
+     QList<IssueMilestone> milestones;
+     for (const QJsonValue &value : QJsonDocument::fromJson(bytes).array()) {
+@@ -864,54 +949,23 @@ bool IssueStore::writeIssueFile(const Issue &issue, QString *error) const
+     QDir().mkpath(issueDir(issue.number));
+     if (issue.events.isEmpty())
+         return false;
+-    const IssueEvent &open = issue.events.first();
+-
+-    // issue.md: issue-level metadata + the open event + the description body.
+-    QStringList lines;
+-    lines << "---";
+-    lines << "schema: forkmesh-issue-v1";
+-    lines << "number: " + QString::number(issue.number);
+-    lines << "title: " + issue.title;
+-    lines << "status: " + issue.status;
+-    lines << "labels: " + serializeList(issue.labels);
+-    lines << "milestone: " + issue.milestone;
+-    lines << "priority: " + QString::number(issue.priority);
+-    lines << "progress: " + QString::number(issue.progress);
+-    lines << "assignees: " + serializeList(issue.assignees);
+-    lines << "createdAt: " + QString::number(issue.createdAt);
+-    lines << "author: " + issue.author;
+-    lines << "authorName: " + issue.authorName;
+-    lines << "bountyUsd: " + QString::number(issue.bountyUsd, 'f', 2);
+-    lines << "bountyAddress: " + issue.bountyAddress;
+-    lines << "bountyStatus: " + issue.bountyStatus;
+-    lines << "type: open";
+-    lines << "id: " + open.id;
+-    lines << "ts: " + QString::number(open.ts);
+-    lines << "attachments: " + serializeList(open.attachments);
+-    lines << "sig: " + open.sig;
+-    lines << "---";
+-    lines << "";
+-    const QString issueText = lines.join('\n') + "\n" + open.body + "\n";
+-    if (!writeTextFile(issueDir(issue.number) + "/issue.md", issueText, error))
+-        return false;
+-
+-    // Each subsequent event is its own NNNN-<type>.md file.
+-    for (int i = 1; i < issue.events.size(); ++i) {
+-        const IssueEvent &ev = issue.events.at(i);
+-        QStringList evLines;
+-        evLines << "---";
+-        appendEventFields(evLines, ev);
+-        evLines << "---";
+-        evLines << "";
+-        const QString body = (ev.type == "comment" || ev.type == "edit") ? ev.body
+-                                                                          : QString();
+-        const QString text = evLines.join('\n') + "\n" + body + "\n";
+-        const QString name =
+-            QStringLiteral("%1-%2.md").arg(i + 1, 4, 10, QChar('0')).arg(ev.type);
+-        if (!writeTextFile(issueDir(issue.number) + "/" + name, text, error))
++
++    // The current format stores the full event log, including bodies, in one JSON
++    // file. Attachments stay as sibling files in the issue folder.
++    QDir dir(issueDir(issue.number));
++    const QStringList oldMarkdown =
++        dir.entryList(QStringList{"*.md"}, QDir::Files, QDir::Name);
++    for (const QString &name : oldMarkdown) {
++        if (!dir.remove(name)) {
++            if (error)
++                *error = QStringLiteral("Could not remove legacy event file %1")
++                             .arg(dir.filePath(name));
+             return false;
++        }
+     }
+-    return true;
++    const QString text =
++        QString::fromUtf8(QJsonDocument(issue.toJson()).toJson(QJsonDocument::Indented));
++    return writeTextFile(dir.filePath(issueJsonName(issue.number)), text, error);
+ }
+ 
+ void IssueStore::recomputeMetadata(Issue &issue) const
+@@ -974,13 +1028,14 @@ QStringList IssueStore::copyAttachments(int number, const QStringList &srcPaths)
+ bool IssueStore::commit(const QString &message, QString *error) const
+ {
+     QString err;
+-    if (!runGit(m_workTree, {"add", "issues"}, nullptr, &err)) {
++    if (!runGit(m_workTree, {"add", kIssuesRoot}, nullptr, &err)) {
+         if (error)
+             *error = "git add failed: " + err;
+         return false;
+     }
+     QByteArray out;
+-    if (!runGit(m_workTree, {"commit", "-m", message, "--", "issues"}, &out, &err)) {
++    if (!runGit(m_workTree, {"commit", "-m", message, "--", kIssuesRoot}, &out,
++                &err)) {
+         if (err.contains("nothing to commit") || err.isEmpty())
+             return true;
+         if (error)
+@@ -993,13 +1048,16 @@ bool IssueStore::commit(const QString &message, QString *error) const
+ int IssueStore::nextNumber() const
+ {
+     int max = 0;
+-    const QStringList entries =
+-        QDir(issuesDir()).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+-    for (const QString &entry : entries) {
+-        bool numeric = false;
+-        const int n = entry.toInt(&numeric);
+-        if (numeric && n > max)
+-            max = n;
++    const QStringList roots{issuesDir(), legacyIssuesDir(m_workTree)};
++    for (const QString &root : roots) {
++        const QStringList entries =
++            QDir(root).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
++        for (const QString &entry : entries) {
++            bool numeric = false;
++            const int n = entry.toInt(&numeric);
++            if (numeric && n > max)
++                max = n;
++        }
+     }
+     return max + 1;
+ }
+@@ -1393,7 +1451,7 @@ bool IssueStore::deleteIssue(int number, QString *error)
+ {
+     if (!canWrite())
+         return false;
+-    const QString relPath = QStringLiteral("issues/%1").arg(number);
++    const QString relPath = kIssuesRoot + QStringLiteral("/%1").arg(number);
+     QString err;
+     if (hasUnrelatedTrackedChanges(m_workTree, relPath, error))
+         return false;
+diff --git a/qt_client/src/IssueStore.h b/qt_client/src/IssueStore.h
+index 528b827d..b761dff5 100644
+--- a/qt_client/src/IssueStore.h
++++ b/qt_client/src/IssueStore.h
+@@ -10,7 +10,7 @@
+ class ForkMeshIdentity;
+ 
+ // One entry in an issue's append-only, signed history. Different event types use
+-// different fields (see issues/README.md). Signatures are raw Ed25519 over an
++// different fields (see .forkmesh/issues). Signatures are raw Ed25519 over an
+ // explicit canonical string, matching the worker's ed25519_verify.
+ struct IssueEvent {
+     QString type;          // open | comment | edit | status | labels | milestone | priority | progress | assignees | agent | bounty | delete
+@@ -19,8 +19,8 @@ struct IssueEvent {
+     QString authorName;
+     qint64 ts = 0;
+     QString title;         // open
+-    QString bodyFile;      // open/comment/edit: markdown path relative to issue dir
+-    QString body;          // in-memory body text loaded from bodyFile (not stored in info.json)
++    QString bodyFile;      // legacy open/comment/edit markdown path, if present
++    QString body;          // open/comment/edit body stored in issue-#.json
+     QStringList attachments; // open/comment/edit (issue-folder-relative paths)
+     QString target;        // edit/delete (event id, or "self" for delete-issue)
+     QString status;        // status: open|closed
+@@ -101,7 +101,7 @@ struct IssueMilestone {
+     QString description;
+ };
+ 
+-// Repo-scoped issue tracker backed by the on-disk issues/ folder. For repos with
++// Repo-scoped issue tracker backed by the on-disk .forkmesh/issues/ folder. For repos with
+ // a local working tree the store reads/writes/commits files directly; for repos
+ // available only as a bare mirror it reads issues read-only via `git show`.
+ class IssueStore
+@@ -125,7 +125,7 @@ public:
+     QList<IssueLabel> loadLabels() const;
+     QList<IssueMilestone> loadMilestones() const;
+ 
+-    // A cheap content signature of the issues/ subtree: its git tree oid (plus the
++    // A cheap content signature of the .forkmesh/issues/ subtree: its git tree oid (plus the
+     // source path, so a different repo can't collide). Two calls return an equal,
+     // non-empty value iff loadAll()/loadLabels()/loadMilestones() would return the
+     // same data, so the UI can skip re-reading and rebuilding the issue list when
+@@ -133,8 +133,8 @@ public:
+     // empty as "unknown" and don't skip. One fast `git rev-parse`, no blob reads.
+     QString contentSignature() const;
+ 
+-    // Mutations (require canWrite()). Each writes the issue's info.json (and the
+-    // label/milestone def files when relevant), then commits the issues/ folder.
++    // Mutations (require canWrite()). Each writes the issue's issue-#.json (and the
++    // label/milestone def files when relevant), then commits the .forkmesh/issues/ folder.
+     int createIssue(const QString &title, const QString &body,
+                     const QStringList &labels, const QString &milestone,
+                     int priority,
+@@ -199,7 +199,7 @@ public:
+     IssueEvent makeSignedEvent(int number, IssueEvent ev) const;
+ 
+     // Merge a signature-bearing event received from the relay inbox into the
+-    // local issues/ folder (used by cross-user sync). The event must already be
++    // local .forkmesh/issues/ folder (used by cross-user sync). The event must already be
+     // signed and verified by the caller.
+     bool applyRemoteEvent(int number, const IssueEvent &ev, const QString &titleIfNew,
+                           QString *error = nullptr,
+@@ -211,8 +211,8 @@ public:
+     static QString contentForSigning(const IssueEvent &ev);
+ 
+ private:
+-    QString issuesDir() const;                 // <workTree>/issues
+-    QString issueDir(int number) const;        // <workTree>/issues/<n>
++    QString issuesDir() const;                 // <workTree>/.forkmesh/issues
++    QString issueDir(int number) const;        // <workTree>/.forkmesh/issues/<n>
+     bool readIssueFile(int number, Issue &out) const;
+     bool writeIssueFile(const Issue &issue, QString *error) const;
+     void recomputeMetadata(Issue &issue) const; // fold events into top-level fields
+diff --git a/qt_client/src/MainWindowActions.cpp b/qt_client/src/MainWindowActions.cpp
+index 7cc86865..a9af69b0 100644
+--- a/qt_client/src/MainWindowActions.cpp
++++ b/qt_client/src/MainWindowActions.cpp
+@@ -310,7 +310,8 @@ void MainWindow::queueWorkflowsForCommit(int repoIndex, const QString &owner,
+             QString::fromUtf8(names.readAllStandardOutput())
+                 .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+         const auto isMetadataPath = [](const QString &p) {
+-            return p.startsWith(QLatin1String("issues/")) ||
++            return p.startsWith(QLatin1String(".forkmesh/issues/")) ||
++                   p.startsWith(QLatin1String("issues/")) ||
+                    p.startsWith(QLatin1String("pulls/")) ||
+                    p.startsWith(QLatin1String("commits/"));
+         };
+@@ -2673,4 +2674,3 @@ void MainWindow::persistVariablesFromTable()
+ {
+     // Variables are written directly in add/edit/delete; nothing to flush here.
+ }
+-
+diff --git a/qt_client/src/MainWindowAgents.cpp b/qt_client/src/MainWindowAgents.cpp
+index e3a7181b..75ea469b 100644
+--- a/qt_client/src/MainWindowAgents.cpp
++++ b/qt_client/src/MainWindowAgents.cpp
+@@ -4626,9 +4626,9 @@ void MainWindow::startClaudeCodeTerminal(AgentSession &session, const Issue &iss
+         const QString prompt =
+             QStringLiteral(
+                 "Resolve ForkMesh issue #%1: %2\n\n"
+-                "The full issue is in issues/%1/issue.md. Implement the change end "
+-                "to end, consistent with the surrounding code, then summarize what "
+-                "you changed and how to verify it.\n")
++                "The full issue is in .forkmesh/issues/%1/issue-%1.json. Implement "
++                "the change end to end, consistent with the surrounding code, then "
++                "summarize what you changed and how to verify it.\n")
+                 .arg(session.issueNumber)
+                 .arg(issue.title);
+         pf.write(prompt.toUtf8());
+@@ -4976,9 +4976,9 @@ void MainWindow::startClaudeCodeTranscript(AgentSession &session, const Issue &i
+         session.baseBranch.isEmpty() ? QStringLiteral("main") : session.baseBranch;
+     // Ad-hoc sessions (issue #273) carry the user's task verbatim as the lead;
+     // issue-assigned sessions get the full title + description + comment thread
+-    // embedded directly (adhoc #256) — pointing only at issues/<n>/issue.md left
+-    // the agent to go dig it up itself, and it sometimes never did. Both share
+-    // the same worktree/commit/PR workflow tail so the run lands as a pull request.
++    // embedded directly (adhoc #256) — pointing only at the raw issue JSON left the
++    // agent to go dig it up itself, and it sometimes never did. Both share the
++    // same worktree/commit/PR workflow tail so the run lands as a pull request.
+     const QString lead =
+         customPrompt.trimmed().isEmpty()
+             ? QStringLiteral(
+@@ -4986,8 +4986,9 @@ void MainWindow::startClaudeCodeTranscript(AgentSession &session, const Issue &i
+                   "%1\n"
+                   "You are working in a dedicated git worktree on branch `%2` "
+                   "(forked from `%3`). The description and comments above are "
+-                  "the full issue context; issues/%4/issue.md holds the same "
+-                  "description verbatim if you need to reference the raw file.\n")
++                  "the full issue context; .forkmesh/issues/%4/issue-%4.json "
++                  "holds the same description if you need to reference the raw "
++                  "file.\n")
+                   .arg(issueContextPrompt(issue), session.branchName, baseName,
+                        QString::number(session.issueNumber))
+             : QStringLiteral(
+@@ -7204,4 +7205,3 @@ void MainWindow::updateAgentActionState()
+             selected && !aiFixBusy && session && !session->branchName.isEmpty()
+             && !isExternalSession(m_selectedAgentSessionId));
+ }
+-
+diff --git a/qt_client/src/MainWindowInternal.h b/qt_client/src/MainWindowInternal.h
+index a2f7c2aa..61e98bcc 100644
+--- a/qt_client/src/MainWindowInternal.h
++++ b/qt_client/src/MainWindowInternal.h
+@@ -5800,10 +5800,10 @@ inline bool runGitCapture(const QString &dir, const QStringList &args, QByteArra
+     return true;
+ }
+ 
+-// True when `workTree`'s issues/ subtree has no uncommitted *tracked* changes —
++// True when `workTree`'s .forkmesh/issues/ subtree has no uncommitted *tracked* changes —
+ // a clean base for the auto-issue-sync to land issue commits on (issue #193).
+-// Scoped to issues/ (not the whole tree) because IssueStore::commit() only ever
+-// stages/commits that path: unrelated in-progress work elsewhere in the repo
++// Scoped to .forkmesh/issues/ (not the whole tree) because IssueStore::commit()
++// only ever stages/commits that path: unrelated in-progress work elsewhere in the repo
+ // (which, on an actively developed source-of-truth checkout, is close to
+ // always) must not permanently block the auto-drain of mirror-filed issues.
+ // Untracked files (build output, scratch notes) are ignored: an issues-only
+@@ -5815,7 +5815,7 @@ inline bool worktreeTrackedClean(const QString &workTree)
+     QByteArray status;
+     if (!runGitCapture(workTree,
+                        {"status", "--porcelain", "--untracked-files=no", "--",
+-                        "issues"},
++                        ".forkmesh/issues"},
+                        &status, nullptr))
+         return false;
+     return QString::fromUtf8(status).trimmed().isEmpty();
+diff --git a/qt_client/src/MainWindowIssues.cpp b/qt_client/src/MainWindowIssues.cpp
+index 363b49e8..e2f17e1a 100644
+--- a/qt_client/src/MainWindowIssues.cpp
++++ b/qt_client/src/MainWindowIssues.cpp
+@@ -2509,11 +2509,13 @@ void MainWindow::renderIssueThread(const Issue &issue)
+ 
+     const int idx = issuesRepoIndex();
+     const QString imageBase =
+-        idx >= 0 ? m_repositories.at(idx).localPath + "/issues/" +
++        idx >= 0 ? m_repositories.at(idx).localPath + "/.forkmesh/issues/" +
+                        QString::number(issue.number) + "/"
+                  : QString();
+     const bool haveLocalFiles = !imageBase.isEmpty() &&
+-                                QFileInfo::exists(imageBase + "issue.md");
++                                QFileInfo::exists(
++                                    imageBase +
++                                    QStringLiteral("issue-%1.json").arg(issue.number));
+     const bool writable = issueStoreForCurrentRepo().canWrite();
+ 
+     auto addCard = [&](const IssueEvent &ev, bool isOpen) {
+@@ -7226,4 +7228,3 @@ QString MainWindow::selfNodeStats() const
+            formatDuration(totalMs) +
+            (key.isEmpty() ? QString() : " \xC2\xB7 key " + key);
+ }
+-
+diff --git a/qt_client/src/RepoHost.cpp b/qt_client/src/RepoHost.cpp
+index a8dae6b6..110b8937 100644
+--- a/qt_client/src/RepoHost.cpp
++++ b/qt_client/src/RepoHost.cpp
+@@ -207,7 +207,7 @@ QJsonObject blobReplyFor(const QString &mirrorPath, const QString &path,
+ }
+ 
+ // Repo-scoped search over a bare mirror (issue #360). One `git grep` at the tip
+-// ref classifies every hit by path: issues/<N>/… and pulls/<N>/… fold into that
++// ref classifies every hit by path: .forkmesh/issues/<N>/… and pulls/<N>/… fold into that
+ // issue/PR (deduped by number, titled from the record's frontmatter); everything
+ // else is a code match. Fixed-string, case-insensitive; caps every bucket hard
+ // so the reply can't balloon into a huge tunnel payload. Runs off the GUI thread
+@@ -218,6 +218,12 @@ QString frontMatterTitle(const QString &mirrorPath, const QString &ref,
+     QByteArray output;
+     if (!runGit(mirrorPath, {"cat-file", "-p", ref + ":" + relPath}, output))
+         return QString();
++    if (relPath.endsWith(QLatin1String(".json"))) {
++        return QJsonDocument::fromJson(output)
++            .object()
++            .value(QStringLiteral("title"))
++            .toString();
++    }
+     for (const QByteArray &line : output.left(4096).split('\n')) {
+         const QString text = QString::fromUtf8(line);
+         if (text.startsWith(QLatin1String("title:")))
+@@ -262,7 +268,7 @@ QJsonObject searchReplyFor(const QString &mirrorPath, const QString &rawQuery)
+     QSet<int> seenPull;
+     static const QRegularExpression rowRe(QStringLiteral("^(.+?):(\\d+):(.*)$"));
+     static const QRegularExpression numberedRe(
+-        QStringLiteral("^(issues|pulls)/(\\d+)/"));
++        QStringLiteral("^(\\.forkmesh/issues|issues|pulls)/(\\d+)/"));
+     const QString prefix = ref + QLatin1Char(':');
+ 
+     for (const QByteArray &raw : output.split('\n')) {
+@@ -282,7 +288,7 @@ QJsonObject searchReplyFor(const QString &mirrorPath, const QString &rawQuery)
+         const QRegularExpressionMatch nm = numberedRe.match(path);
+         if (nm.hasMatch()) {
+             const int number = nm.captured(2).toInt();
+-            const bool isIssue = nm.captured(1) == QLatin1String("issues");
++            const bool isIssue = nm.captured(1) != QLatin1String("pulls");
+             QSet<int> &seen = isIssue ? seenIssue : seenPull;
+             if (seen.contains(number))
+                 continue;
+@@ -290,8 +296,12 @@ QJsonObject searchReplyFor(const QString &mirrorPath, const QString &rawQuery)
+             if (bucket.size() >= (isIssue ? kMaxIssues : kMaxPulls))
+                 continue;
+             seen.insert(number);
++            const bool legacyIssue = nm.captured(1) == QLatin1String("issues");
+             const QString titleFile =
+-                isIssue ? QStringLiteral("issues/%1/issue.md").arg(number)
++                isIssue ? (legacyIssue
++                               ? QStringLiteral("issues/%1/issue.md").arg(number)
++                               : QStringLiteral(".forkmesh/issues/%1/issue-%1.json")
++                                     .arg(number))
+                         : QStringLiteral("pulls/%1/pull.md").arg(number);
+             bucket.append(QJsonObject{
+                 {"number", number},
+@@ -1127,8 +1137,11 @@ QJsonObject RepoHost::buildRootCounts(const QString &ref) const
+     QByteArray output;
+     if (runGit(m_mirrorPath, {"rev-list", "--count", ref}, output))
+         commits = QString::fromUtf8(output).trimmed().toInt();
++    int issues = countNumberedDirs(m_mirrorPath, ref, QStringLiteral(".forkmesh/issues"));
++    if (issues == 0)
++        issues = countNumberedDirs(m_mirrorPath, ref, QStringLiteral("issues"));
+     return QJsonObject{
+-        {"issues", countNumberedDirs(m_mirrorPath, ref, QStringLiteral("issues"))},
++        {"issues", issues},
+         {"pulls", countNumberedDirs(m_mirrorPath, ref, QStringLiteral("pulls"))},
+         {"discussions",
+          countNumberedDirs(m_mirrorPath, ref, QStringLiteral("discussions"))},
+diff --git a/qt_client/tests/test_crypto.cpp b/qt_client/tests/test_crypto.cpp
+index 3b17bae2..fd68603f 100644
+--- a/qt_client/tests/test_crypto.cpp
++++ b/qt_client/tests/test_crypto.cpp
+@@ -838,8 +838,15 @@ int main(int argc, char *argv[])
+                   loaded.first().milestone == "v1" &&
+                   loaded.first().priority == 7,
+               "issue loads back with title, label, milestone and priority");
++        const QString issueJson =
++            QStringLiteral(".forkmesh/issues/%1/issue-%1.json").arg(n);
+         check(!loaded.isEmpty() && loaded.first().events.first().body == "Hello **body**",
+-              "open-event body round-trips from issue.md frontmatter");
++              "open-event body round-trips from the issue JSON file");
++        check(QFileInfo::exists(QDir(tmp.path()).filePath(issueJson)),
++              "issue is stored under .forkmesh/issues as issue-#.json");
++        check(!QFileInfo::exists(QDir(tmp.path()).filePath(
++                  QStringLiteral("issues/%1/issue.md").arg(n))),
++              "new issues do not write issue.md");
+ 
+         check(repo.addComment(n, "a comment", {}, &err), "addComment succeeds");
+         check(repo.setStatus(n, "closed", &err), "setStatus succeeds");
+@@ -865,7 +872,10 @@ int main(int argc, char *argv[])
+                      e.agentSessionId == 0 && !e.agentCreatePr &&
+                      e.agentStatus == "cleared")
+                 sawAgentClear = true;
+-        check(sawComment, "comment body round-trips from NNNN-comment.md");
++        check(sawComment, "comment body round-trips from the issue JSON file");
++        check(!QFileInfo::exists(QDir(tmp.path()).filePath(
++                  QStringLiteral(".forkmesh/issues/%1/0002-comment.md").arg(n))),
++              "comments do not write separate markdown event files");
+         check(sawAgentAssign, "agent assignment event round-trips");
+         check(sawAgentClear, "agent clear event round-trips");
+         check(loaded.first().status == "closed", "status reflects close event");
+@@ -881,7 +891,7 @@ int main(int argc, char *argv[])
+                                [&](const Issue &i) { return i.number == tomb; }),
+               "tombstoned issue no longer loads but others remain");
+         check(!gitOutput({"log", "--all", "--",
+-                          QStringLiteral("issues/%1").arg(tomb)})
++                          QStringLiteral(".forkmesh/issues/%1").arg(tomb)})
+                    .trimmed()
+                    .isEmpty(),
+               "tombstoned issue is preserved in git history");
+@@ -891,7 +901,8 @@ int main(int argc, char *argv[])
+         check(std::none_of(afterDelete.begin(), afterDelete.end(),
+                            [&](const Issue &i) { return i.number == n; }),
+               "deleted issue no longer loads");
+-        check(gitOutput({"log", "--all", "--", QStringLiteral("issues/%1").arg(n)})
++        check(gitOutput({"log", "--all", "--",
++                         QStringLiteral(".forkmesh/issues/%1").arg(n)})
+                   .trimmed()
+                   .isEmpty(),
+               "deleted issue is purged from git history");
+diff --git a/tools/forkmesh_mcp_server.py b/tools/forkmesh_mcp_server.py
+index 5579e224..7bf73398 100755
+--- a/tools/forkmesh_mcp_server.py
++++ b/tools/forkmesh_mcp_server.py
+@@ -173,19 +173,27 @@ def sign_issue_event(number, ev):
+ 
+ 
+ def issues_dir(repo):
++    return Path(repo) / ".forkmesh/issues"
++
++
++def legacy_issues_dir(repo):
+     return Path(repo) / "issues"
+ 
+ 
+ def next_issue_number(repo):
+-    d = issues_dir(repo)
+     mx = 0
+-    if d.exists():
+-        for entry in d.iterdir():
+-            if entry.is_dir() and entry.name.isdigit():
+-                mx = max(mx, int(entry.name))
++    for d in (issues_dir(repo), legacy_issues_dir(repo)):
++        if d.exists():
++            for entry in d.iterdir():
++                if entry.is_dir() and entry.name.isdigit():
++                    mx = max(mx, int(entry.name))
+     return mx + 1
+ 
+ 
++def issue_json_path(repo, number):
++    return issues_dir(repo) / str(number) / f"issue-{number}.json"
++
++
+ def read_frontmatter(path):
+     text = Path(path).read_text(errors="replace")
+     m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+@@ -210,43 +218,39 @@ def create_issue(repo, title, body, labels, milestone, priority, assignees):
+     }
+     ev["sig"] = sign_issue_event(number, ev)
+ 
+-    lines = [
+-        "---",
+-        "schema: forkmesh-issue-v1",
+-        f"number: {number}",
+-        f"title: {title}",
+-        "status: open",
+-        f"labels: {serialize_list(labels)}",
+-        f"milestone: {milestone}",
+-        f"priority: {max(0, min(99, priority))}",
+-        "progress: 0",
+-        f"assignees: {serialize_list(assignees)}",
+-        f"createdAt: {ts}",
+-        f"author: {pub}",
+-        f"authorName: {author_name(repo)}",
+-        "bountyUsd: 0.00",
+-        "bountyAddress: ",
+-        "bountyStatus: ",
+-        "type: open",
+-        f"id: {ev['id']}",
+-        f"ts: {ts}",
+-        "attachments: []",
+-        f"sig: {ev['sig']}",
+-        "---",
+-        "",
+-    ]
+     idir = issues_dir(repo) / str(number)
+     idir.mkdir(parents=True, exist_ok=True)
+-    (idir / "issue.md").write_text("\n".join(lines) + "\n" + body + "\n")
++    issue = {
++        "schema": "forkmesh-issue-v1",
++        "number": number,
++        "title": title,
++        "status": "open",
++        "labels": labels,
++        "milestone": milestone,
++        "priority": max(0, min(99, priority)),
++        "progress": 0,
++        "assignees": assignees,
++        "createdAt": ts,
++        "author": pub,
++        "authorName": author_name(repo),
++        "bountyUsd": 0.0,
++        "bountyAddress": "",
++        "bountyStatus": "",
++        "events": [ev],
++    }
++    (idir / f"issue-{number}.json").write_text(
++        json.dumps(issue, indent=4, ensure_ascii=False) + "\n")
+ 
+-    _commit(repo, "issues", f"issue #{number}: {title}")
++    _commit(repo, ".forkmesh/issues", f"issue #{number}: {title}")
+     return number
+ 
+ 
+ def comment_on_issue(repo, number, body):
+     idir = issues_dir(repo) / str(number)
+-    if not (idir / "issue.md").exists():
++    path = issue_json_path(repo, number)
++    if not path.exists():
+         raise ValueError(f"issue #{number} not found")
++    issue = json.loads(path.read_text(errors="replace"))
+     _, pub = load_identity()
+     ts = int(time.time() * 1000)
+     body = strip_edge_newlines(body or "")
+@@ -256,26 +260,10 @@ def comment_on_issue(repo, number, body):
+     }
+     ev["sig"] = sign_issue_event(number, ev)
+ 
+-    # Event files are named NNNN-<type>.md where NNNN is the 1-based event
+-    # index (issue.md is the open event at index 1). Append after existing ones.
+-    existing = sum(1 for f in idir.iterdir()
+-                   if re.match(r"^\d{4}-.+\.md$", f.name))
+-    nnnn = existing + 2
+-    lines = [
+-        "---",
+-        "type: comment",
+-        f"id: {ev['id']}",
+-        f"author: {pub}",
+-        f"authorName: {ev['authorName']}",
+-        f"ts: {ts}",
+-        "attachments: []",
+-        f"sig: {ev['sig']}",
+-        "---",
+-        "",
+-    ]
+-    (idir / f"{nnnn:04d}-comment.md").write_text("\n".join(lines) + "\n" + body + "\n")
+-    _commit(repo, "issues", f"issue #{number}: comment")
+-    return nnnn
++    issue.setdefault("events", []).append(ev)
++    path.write_text(json.dumps(issue, indent=4, ensure_ascii=False) + "\n")
++    _commit(repo, ".forkmesh/issues", f"issue #{number}: comment")
++    return len(issue["events"])
+ 
+ 
+ def search_issues(repo, query, status=None):
+@@ -286,20 +274,25 @@ def search_issues(repo, query, status=None):
+     q = (query or "").lower()
+     for idir in sorted(d.iterdir(),
+                        key=lambda p: int(p.name) if p.name.isdigit() else 0):
+-        md = idir / "issue.md"
+-        if not (idir.is_dir() and idir.name.isdigit() and md.exists()):
++        if not (idir.is_dir() and idir.name.isdigit()):
++            continue
++        path = issue_json_path(repo, int(idir.name))
++        if not path.exists():
+             continue
+-        fields, body = read_frontmatter(md)
+-        st = fields.get("status", "open")
++        issue = json.loads(path.read_text(errors="replace"))
++        st = issue.get("status", "open")
+         if status and st != status:
+             continue
+-        title = fields.get("title", "")
++        title = issue.get("title", "")
++        body = " ".join(
++            ev.get("body", "") for ev in issue.get("events", [])
++            if ev.get("type") in ("open", "comment", "edit"))
+         if q and q not in title.lower() and q not in body.lower():
+             continue
+         out.append({
+             "number": int(idir.name), "title": title, "status": st,
+-            "labels": fields.get("labels", "[]"),
+-            "author": fields.get("authorName", fields.get("author", "")),
++            "labels": issue.get("labels", []),
++            "author": issue.get("authorName", issue.get("author", "")),
+         })
+     return out
+ 
+diff --git a/tools/test_forkmesh_mcp_server.py b/tools/test_forkmesh_mcp_server.py
+index dba46eab..415b3bdb 100755
+--- a/tools/test_forkmesh_mcp_server.py
++++ b/tools/test_forkmesh_mcp_server.py
+@@ -118,11 +118,13 @@ def main():
+     text, err = call("create_issue", {"title": "First bug", "body": "it broke",
+                                        "labels": ["bug"]})
+     check("create_issue", not err and "#1" in text)
+-    fields, body = srv.read_frontmatter(repo / "issues/1/issue.md")
+-    ev = {"type": "open", "author": fields["author"], "ts": int(fields["ts"]),
+-          "attachments": [], "title": fields["title"], "body": body.strip("\n")}
++    issue_path = repo / ".forkmesh/issues/1/issue-1.json"
++    issue = json.loads(issue_path.read_text())
++    open_ev = issue["events"][0]
++    ev = {"type": "open", "author": open_ev["author"], "ts": int(open_ev["ts"]),
++          "attachments": [], "title": open_ev["title"], "body": open_ev["body"]}
+     canonical = _canonical(1, ev)
+-    check("issue signature verifies", _verify(pub_b64, fields["sig"], canonical))
++    check("issue signature verifies", _verify(pub_b64, open_ev["sig"], canonical))
+     check("issue committed", "issue #1" in subprocess.run(
+         ["git", "-C", str(repo), "log", "-1", "--format=%s"],
+         capture_output=True, text=True).stdout)
+@@ -136,13 +138,14 @@ def main():
+     # comment_on_issue -> signed + verifiable
+     _, err = call("comment_on_issue", {"number": 1, "body": "me too"})
+     check("comment_on_issue", not err)
+-    cfile = repo / "issues/1/0002-comment.md"
+-    check("comment file written", cfile.exists())
+-    fields, body = srv.read_frontmatter(cfile)
+-    ev = {"type": "comment", "author": fields["author"], "ts": int(fields["ts"]),
+-          "attachments": [], "body": body.strip("\n")}
++    check("comment markdown not written",
++          not (repo / ".forkmesh/issues/1/0002-comment.md").exists())
++    issue = json.loads(issue_path.read_text())
++    comment_ev = issue["events"][1]
++    ev = {"type": "comment", "author": comment_ev["author"],
++          "ts": int(comment_ev["ts"]), "attachments": [], "body": comment_ev["body"]}
+     check("comment signature verifies",
+-          _verify(pub_b64, fields["sig"], _canonical(1, ev)))
++          _verify(pub_b64, comment_ev["sig"], _canonical(1, ev)))
+ 
+     # open_pr_from_branch + get_pr_diff
+     git("checkout", "-q", "-b", "feature")

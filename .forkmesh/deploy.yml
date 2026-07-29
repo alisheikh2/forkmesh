@@ -1,0 +1,59 @@
+name: Deploy Cloudflare Worker
+on: [push]
+jobs:
+  deploy:
+    steps:
+      - name: Skip unless worker files changed
+        run: |
+          # Determine which files this push changed. HEAD is normally a MERGE
+          # commit (agent branches land on main via merge), and a plain
+          # `git diff-tree HEAD` emits NOTHING for a merge — its default is the
+          # combined diff, which suppresses paths that match either parent. That
+          # made every merge-to-main skip this deploy even when the merged
+          # branch changed cloudflare_worker/ (issue #267). Diff against the
+          # first parent (the old main tip) instead, so a merge that brings in
+          # worker changes is detected; fall back to the empty tree for a root
+          # commit with no parent.
+          if parent="$(git rev-parse --verify --quiet HEAD^1)"; then
+            changed_files="$(git diff-tree --no-commit-id --name-only -r "$parent" HEAD)"
+          else
+            changed_files="$(git diff-tree --no-commit-id --name-only -r --root HEAD)"
+          fi
+          worker_changes="$(printf '%s\n' "$changed_files" | sed -n '/^cloudflare_worker\//p')"
+          if [ -z "$worker_changes" ]; then
+            echo "Skipping deploy; no cloudflare_worker/ changes in this commit."
+            touch .forkmesh-skip-deploy
+          else
+            echo "Deploying; cloudflare_worker/ changes detected:"
+            printf '%s\n' "$worker_changes"
+          fi
+      # CI/CD gate: run the crypto tests first; a failure aborts before deploy. they are set now
+      - name: Run tests
+        run: |
+          [ -f .forkmesh-skip-deploy ] && exit 0
+          python3 cloudflare_worker/tests/test_crypto.py
+      # .env.production is gitignored, so materialize it from this node's ForkMesh
+      # Variables/Secrets (Settings -> Secrets & Coves). ForkMesh fills in the
+      # ${{ vars.NAME }} references below from that store before running the step;
+      # GitHub-Actions ${{ secrets.NAME }} and step-level `env:` are NOT understood
+      # here, so reference vars.* instead. deploy.sh then reads .env.production,
+      # exports CLOUDFLARE_* for wrangler, and pushes the Worker secrets. The
+      # quoted 'EOF' writes the substituted values verbatim (no shell re-expansion),
+      # so a token/password containing $ or backticks survives intact.
+      - name: Write production env (admin dashboard vars)
+        run: |
+          [ -f .forkmesh-skip-deploy ] && exit 0
+          cat > cloudflare_worker/.env.production <<'EOF'
+          CLOUDFLARE_ACCOUNT_ID=${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN=${{ vars.CLOUDFLARE_API_TOKEN }}
+          ADMIN_PATH=${{ vars.ADMIN_PATH }}
+          ADMIN_USER=${{ vars.ADMIN_USER }}
+          ADMIN_PASS=${{ vars.ADMIN_PASS }}
+          TREASURY_SOLANA_ADDRESS=${{ vars.TREASURY_SOLANA_ADDRESS }}
+          MAILTRAP_API_TOKEN=${{ vars.MAILTRAP_API_TOKEN }}
+          DATA_KEY=${{ vars.DATA_KEY }}
+          EOF
+      - name: Deploy worker
+        run: |
+          [ -f .forkmesh-skip-deploy ] && exit 0
+          cd cloudflare_worker && ./deploy.sh

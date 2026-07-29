@@ -1,0 +1,239 @@
+diff --git a/qt_client/src/MainWindow.h b/qt_client/src/MainWindow.h
+index c066b25f..065a4f9c 100644
+--- a/qt_client/src/MainWindow.h
++++ b/qt_client/src/MainWindow.h
+@@ -394,6 +394,10 @@ public:
+     }
+     QString testAgentStatusCellText(int sessionId) const;
+     bool testAgentSessionMerged(int sessionId) const;
++    void testImportPatchAsPullFromPath(const QString &path)
++    {
++        importPatchAsPullFromPath(path);
++    }
+ #endif
+ 
+     // --- Headless / CLI support (HeadlessConsole) ------------------------------
+@@ -1054,6 +1058,7 @@ private:
+     void submitPullReview(const QString &state);    // approve / request changes
+     void promptNewPull();
+     void importPatchAsPull(); // read a .patch/.diff file and open it as a PR
++    void importPatchAsPullFromPath(const QString &path);
+     void promptNewPullFromDirectory();
+     void promptNewPullFromSource(const QString &sourceDir,
+                                  const QString &preferredBase = QString(),
+diff --git a/qt_client/src/MainWindowPulls.cpp b/qt_client/src/MainWindowPulls.cpp
+index 84425c8e..171332d1 100644
+--- a/qt_client/src/MainWindowPulls.cpp
++++ b/qt_client/src/MainWindowPulls.cpp
+@@ -3552,6 +3552,14 @@ void MainWindow::promptNewPull()
+ }
+ 
+ void MainWindow::importPatchAsPull()
++{
++    const QString path = QFileDialog::getOpenFileName(
++        this, "Import patch as pull request", QDir::homePath(),
++        "Patch files (*.patch *.diff);;All files (*)");
++    importPatchAsPullFromPath(path);
++}
++
++void MainWindow::importPatchAsPullFromPath(const QString &path)
+ {
+     if (m_repoDetailIndex < 0 || m_repoDetailIndex >= m_repositories.size())
+         return;
+@@ -3562,9 +3570,6 @@ void MainWindow::importPatchAsPull()
+             "Importing a patch needs a writable local checkout of this repo.", true);
+         return;
+     }
+-    const QString path = QFileDialog::getOpenFileName(
+-        this, "Import patch as pull request", QDir::homePath(),
+-        "Patch files (*.patch *.diff);;All files (*)");
+     if (path.isEmpty())
+         return;
+     QFile file(path);
+@@ -3598,25 +3603,6 @@ void MainWindow::importPatchAsPull()
+     const QStringList branches = repoBranches();
+     const QString base = repoDefaultBranch(branches);
+ 
+-    // Sanity-check that the patch applies to the base before opening the PR.
+-    QString applyErr;
+-    QProcess check;
+-    check.setProgram("git");
+-    check.setArguments({"-C", dir, "apply", "--check", "--3way", path});
+-    check.start();
+-    check.waitForFinished(8000);
+-    if (check.exitStatus() != QProcess::NormalExit || check.exitCode() != 0) {
+-        const QString detail =
+-            QString::fromUtf8(check.readAllStandardError()).trimmed();
+-        if (QMessageBox::warning(
+-                this, "Import patch",
+-                QStringLiteral("This patch does not apply cleanly onto %1:\n\n%2\n\n"
+-                               "Open the pull request anyway?")
+-                    .arg(base, detail.isEmpty() ? "(no details)" : detail),
+-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+-            return;
+-    }
+-
+     // Synthesize a head label from the title; the patch itself carries the change.
+     QString head = QStringLiteral("imported/") +
+                    title.toLower().replace(QRegularExpression(QStringLiteral("[^a-z0-9]+")),
+@@ -3625,21 +3611,66 @@ void MainWindow::importPatchAsPull()
+     if (head.endsWith(QLatin1Char('-')))
+         head.chop(1);
+ 
+-    QString error;
+-    const int number = store.createPull(
+-        title, QStringLiteral("Imported from patch file `%1`.").arg(QFileInfo(path).fileName()),
+-        base, head, patch, QString(), /*branchBacked=*/false, &error);
+-    if (number < 0) {
+-        setRepoDetailNotice(error.isEmpty() ? "Could not create the pull request."
++    setRepoDetailNotice("Checking patch...");
++    const int repoIndex = m_repoDetailIndex;
++    auto applies = std::make_shared<bool>(false);
++    auto detail = std::make_shared<QString>();
++    QThread *worker = QThread::create([dir, path, applies, detail] {
++        QProcess check;
++        check.setProgram("git");
++        check.setArguments({"-C", dir, "apply", "--check", "--3way", path});
++        check.start();
++        const bool finished = check.waitForFinished(8000);
++        *applies = finished && check.exitStatus() == QProcess::NormalExit &&
++                   check.exitCode() == 0;
++        if (!*applies) {
++            *detail = finished
++                          ? QString::fromUtf8(check.readAllStandardError()).trimmed()
++                          : QStringLiteral("git apply --check timed out");
++        }
++    });
++    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
++    connect(worker, &QThread::finished, this,
++            [this, repoIndex, store, path, title, base, head, patch, applies,
++             detail]() mutable {
++                if (m_repoDetailIndex != repoIndex)
++                    return;
++                if (!*applies) {
++                    if (QMessageBox::warning(
++                            this, "Import patch",
++                            QStringLiteral("This patch does not apply cleanly onto %1:\n\n%2\n\n"
++                                           "Open the pull request anyway?")
++                                .arg(base, detail->isEmpty() ? "(no details)" : *detail),
++                            QMessageBox::Yes | QMessageBox::No,
++                            QMessageBox::No) != QMessageBox::Yes) {
++                        setRepoDetailNotice("Patch import cancelled.", true);
++                        return;
++                    }
++                }
++
++                QString error;
++                const int number = store.createPull(
++                    title,
++                    QStringLiteral("Imported from patch file `%1`.")
++                        .arg(QFileInfo(path).fileName()),
++                    base, head, patch, QString(), /*branchBacked=*/false, &error);
++                if (number < 0) {
++                    setRepoDetailNotice(error.isEmpty()
++                                            ? "Could not create the pull request."
+                                             : error,
+-                            true);
+-        return;
+-    }
+-    logSystem(QStringLiteral("Imported patch %1 as pull #%2.").arg(path).arg(number));
+-    setRepoDetailNotice(QStringLiteral("Imported patch as pull #%1.").arg(number));
+-    m_currentPullNumber = number;
+-    switchToPullTab(number);
+-    propagateRepoUpdate(m_repoDetailIndex);
++                                        true);
++                    return;
++                }
++                logSystem(QStringLiteral("Imported patch %1 as pull #%2.")
++                              .arg(path)
++                              .arg(number));
++                setRepoDetailNotice(QStringLiteral("Imported patch as pull #%1.")
++                                        .arg(number));
++                m_currentPullNumber = number;
++                switchToPullTab(number);
++                propagateRepoUpdate(m_repoDetailIndex);
++            });
++    worker->start();
+ }
+ 
+ void MainWindow::promptNewPullFromDirectory()
+@@ -7100,4 +7131,3 @@ void MainWindow::pollOwnedInboxes()
+         drainCommitInboxFor(repo, /*interactive=*/false);
+     }
+ }
+-
+diff --git a/qt_client/tests/test_window_resize.cpp b/qt_client/tests/test_window_resize.cpp
+index 025d803a..7df0a1d8 100644
+--- a/qt_client/tests/test_window_resize.cpp
++++ b/qt_client/tests/test_window_resize.cpp
+@@ -18,6 +18,7 @@
+ #include <QSettings>
+ #include <QStandardPaths>
+ #include <QTemporaryDir>
++#include <QTextStream>
+ #include <QWidget>
+ 
+ #include <algorithm>
+@@ -983,6 +984,62 @@ int main(int argc, char *argv[])
+         }
+     }
+ 
++    // Importing a patch must not synchronously wait on `git apply --check` on the
++    // GUI thread. A fake git that sleeps before delegating makes the old blocking
++    // path take >1s; the fixed path returns immediately and finishes later.
++    {
++        QTemporaryDir importRepo;
++        QTemporaryDir fakeBin;
++        QTemporaryDir patchDir;
++        if (initGitRepo(importRepo) && fakeBin.isValid() && patchDir.isValid()) {
++            QFile wrapper(fakeBin.path() + QStringLiteral("/git"));
++            if (wrapper.open(QIODevice::WriteOnly | QIODevice::Text)) {
++                QTextStream ts(&wrapper);
++                ts << "#!/bin/sh\n"
++                   << "if [ \"$3\" = apply ] && [ \"$4\" = --check ]; then sleep 1; fi\n"
++                   << "exec /usr/bin/git \"$@\"\n";
++                wrapper.close();
++                wrapper.setPermissions(wrapper.permissions() | QFile::ExeOwner |
++                                       QFile::ExeGroup | QFile::ExeOther);
++            }
++            QFile patch(patchDir.path() + QStringLiteral("/change.patch"));
++            if (patch.open(QIODevice::WriteOnly | QIODevice::Text)) {
++                QTextStream ts(&patch);
++                ts << "diff --git a/new.txt b/new.txt\n"
++                   << "new file mode 100644\n"
++                   << "index 0000000..1269488\n"
++                   << "--- /dev/null\n"
++                   << "+++ b/new.txt\n"
++                   << "@@ -0,0 +1 @@\n"
++                   << "+hello\n";
++                patch.close();
++            }
++
++            MainWindow importWindow;
++            importWindow.show();
++            QApplication::processEvents();
++            const int idx = importWindow.testAddLocalRepository(
++                "me", "importrepo", importRepo.path());
++            importWindow.testOpenRepository(idx);
++            QApplication::processEvents();
++
++            const QByteArray oldPath = qgetenv("PATH");
++            qputenv("PATH", (fakeBin.path() + QLatin1Char(':') +
++                              QString::fromUtf8(oldPath)).toUtf8());
++            QElapsedTimer timer;
++            timer.start();
++            importWindow.testImportPatchAsPullFromPath(patch.fileName());
++            const qint64 elapsed = timer.elapsed();
++            qputenv("PATH", oldPath);
++
++            check(elapsed < 500,
++                  QString("import patch returns before slow apply check "
++                          "(elapsed=%1ms)")
++                      .arg(elapsed));
++            stopChildProcesses(importWindow);
++        }
++    }
++
+     // Issue #287: the headless "mirrors" view leads with this node's own CPU and
+     // memory so an operator watching a durable daemon can see its load, and the
+     // "status" view carries the same Load line.

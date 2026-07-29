@@ -1,0 +1,259 @@
+diff --git a/qt_client/src/MainWindow.h b/qt_client/src/MainWindow.h
+index c066b25f..c8dc75c4 100644
+--- a/qt_client/src/MainWindow.h
++++ b/qt_client/src/MainWindow.h
+@@ -394,6 +394,13 @@ public:
+     }
+     QString testAgentStatusCellText(int sessionId) const;
+     bool testAgentSessionMerged(int sessionId) const;
++    void testSetBackend(ChatBackend *backend)
++    {
++        m_backend = backend;
++        m_mirrorAdvertSig.clear();
++        m_mirrorAdvertBuildSig.clear();
++    }
++    void testRefreshRepositoryList() { refreshRepositoryList(); }
+ #endif
+ 
+     // --- Headless / CLI support (HeadlessConsole) ------------------------------
+@@ -4215,6 +4222,7 @@ private:
+     // onRequestServed (adhoc #83); skip the rebuild while the signature is
+     // unchanged. Reset by attachBackend so a freshly attached backend is re-pushed.
+     QString m_mirrorAdvertSig;
++    QString m_mirrorAdvertBuildSig;
+     int m_repoOpenPending = -1;        // repo index queued by openRepoDetailDeferred
+     // True while a user-driven repo load (a node switch or opening a repo) runs,
+     // so nodeSwitchStep narrates progress for both, not just node switches.
+diff --git a/qt_client/src/MainWindowRepos.cpp b/qt_client/src/MainWindowRepos.cpp
+index f627f708..16799b61 100644
+--- a/qt_client/src/MainWindowRepos.cpp
++++ b/qt_client/src/MainWindowRepos.cpp
+@@ -473,44 +473,76 @@ void MainWindow::refreshRepositoryList()
+                         .toMSecsSinceEpoch()) +
+                 QLatin1Char('\n');
+         }
+-        if (advertSig != m_mirrorAdvertSig) {
+-        GitKeepAlive keepAlive;
+-        QList<MirrorAdvert> ours;
+-        for (const RepositoryRecord &repo : std::as_const(m_repositories)) {
+-            if (repo.previewOnly)
+-                continue;
+-            MirrorAdvert advert;
+-            advert.ownerName = catalogOwner(repo) + "/" +
+-                               repoSegment(repo.name, QStringLiteral("repository"));
+-            // Shared upstream identity: every node mirroring the same source repo
+-            // carries the same "<sourceOwner>/name", so the mirror-nodes view can
+-            // group them even though each advertises its own clone (catalog) owner.
+-            advert.source = repoSegment(repo.owner, QStringLiteral("owner")) + "/" +
++        if (advertSig != m_mirrorAdvertSig &&
++            advertSig != m_mirrorAdvertBuildSig) {
++            m_mirrorAdvertBuildSig = advertSig;
++            const QList<RepositoryRecord> repos = m_repositories;
++            const QString account = accountOwner();
++            QPointer<ChatBackend> backend = m_backend;
++            runOffThread<QList<MirrorAdvert>>(
++                [repos, account] {
++                    QList<MirrorAdvert> ours;
++                    for (const RepositoryRecord &repo : repos) {
++                        if (repo.previewOnly)
++                            continue;
++                        MirrorAdvert advert;
++                        const QString owner = account.isEmpty()
++                                                  ? repoSegment(
++                                                        repo.owner,
++                                                        QStringLiteral("owner"))
++                                                  : account;
++                        advert.ownerName =
++                            owner + "/" +
+                             repoSegment(repo.name, QStringLiteral("repository"));
+-            // Advertise the HEAD this node currently holds so peers can see how
+-            // fresh our mirror is relative to theirs.
+-            advert.branch = mirrorHeadBranch(repo.mirrorPath);
+-            advert.commit = mirrorBranchCommit(repo.mirrorPath, advert.branch);
+-            advert.updatedMs = repo.lastSyncMs;
+-            // On-disk mirror size so peers can show how much data we're holding.
+-            advert.sizeBytes = mirrorRepoSizeBytes(repo.mirrorPath);
+-            // Issues we're mirroring, so peers can show the count per node.
+-            advert.issueCount = mirrorIssueCount(repo.mirrorPath, advert.branch);
+-            // More tallies the Mirror nodes view shows per node: history depth,
+-            // branch/PR/discussion counts, and our live worktree (agent task) count.
+-            advert.commitCount = mirrorCommitCount(repo.mirrorPath, advert.branch);
+-            advert.branchCount = mirrorBranchCount(repo.mirrorPath);
+-            advert.pullCount = mirrorPullCount(repo.mirrorPath, advert.branch);
+-            advert.discussionCount =
+-                mirrorDiscussionCount(repo.mirrorPath, advert.branch);
+-            advert.worktreeCount = mirrorWorktreeCount(repo.localPath);
+-            // Release artifacts we're actually hosting for download (issue #304 CAS
+-            // blobs), so peers can see which nodes can serve a binary.
+-            advert.artifactCount = mirrorArtifactCount(repo.mirrorPath);
+-            ours.append(advert);
+-        }
+-        m_backend->setMirroredRepos(ours);
+-        m_mirrorAdvertSig = advertSig;
++                        // Shared upstream identity: every node mirroring the same
++                        // source repo carries the same "<sourceOwner>/name", so
++                        // the mirror-nodes view can group them even though each
++                        // advertises its own clone (catalog) owner.
++                        advert.source =
++                            repoSegment(repo.owner, QStringLiteral("owner")) + "/" +
++                            repoSegment(repo.name, QStringLiteral("repository"));
++                        // Advertise the HEAD this node currently holds so peers can
++                        // see how fresh our mirror is relative to theirs.
++                        advert.branch = mirrorHeadBranch(repo.mirrorPath);
++                        advert.commit =
++                            mirrorBranchCommit(repo.mirrorPath, advert.branch);
++                        advert.updatedMs = repo.lastSyncMs;
++                        // On-disk mirror size so peers can show how much data
++                        // we're holding. This shells out to git count-objects and
++                        // must stay off the GUI thread.
++                        advert.sizeBytes = mirrorRepoSizeBytes(repo.mirrorPath);
++                        // Issues we're mirroring, so peers can show the count per
++                        // node.
++                        advert.issueCount =
++                            mirrorIssueCount(repo.mirrorPath, advert.branch);
++                        // More tallies the Mirror nodes view shows per node:
++                        // history depth, branch/PR/discussion counts, and our live
++                        // worktree (agent task) count.
++                        advert.commitCount =
++                            mirrorCommitCount(repo.mirrorPath, advert.branch);
++                        advert.branchCount = mirrorBranchCount(repo.mirrorPath);
++                        advert.pullCount =
++                            mirrorPullCount(repo.mirrorPath, advert.branch);
++                        advert.discussionCount =
++                            mirrorDiscussionCount(repo.mirrorPath, advert.branch);
++                        advert.worktreeCount = mirrorWorktreeCount(repo.localPath);
++                        // Release artifacts we're actually hosting for download
++                        // (issue #304 CAS blobs), so peers can see which nodes can
++                        // serve a binary.
++                        advert.artifactCount = mirrorArtifactCount(repo.mirrorPath);
++                        ours.append(advert);
++                    }
++                    return ours;
++                },
++                [this, advertSig, backend](QList<MirrorAdvert> ours) {
++                    if (m_mirrorAdvertBuildSig == advertSig)
++                        m_mirrorAdvertBuildSig.clear();
++                    if (!backend || backend != m_backend ||
++                        m_mirrorAdvertSig == advertSig)
++                        return;
++                    m_backend->setMirroredRepos(ours);
++                    m_mirrorAdvertSig = advertSig;
++                });
+         }
+     }
+ }
+@@ -3018,4 +3050,3 @@ void MainWindow::uninstallForkMesh()
+ 
+     QCoreApplication::exit(0);
+ }
+-
+diff --git a/qt_client/src/MainWindowSettings.cpp b/qt_client/src/MainWindowSettings.cpp
+index cce14f9a..2f5d3188 100644
+--- a/qt_client/src/MainWindowSettings.cpp
++++ b/qt_client/src/MainWindowSettings.cpp
+@@ -1815,6 +1815,7 @@ void MainWindow::attachBackend(ChatBackend *backend)
+     // Force refreshRepositoryList to re-push the mirror adverts to this backend even
+     // if the repo signature hasn't changed since the last one (adhoc #83 skip cache).
+     m_mirrorAdvertSig.clear();
++    m_mirrorAdvertBuildSig.clear();
+ 
+     connect(backend, &ChatBackend::messageArrived, this, &MainWindow::onMessage);
+     connect(backend, &ChatBackend::reactionChanged, this, &MainWindow::onReaction);
+@@ -3277,4 +3278,3 @@ void MainWindow::submitVulnerabilityReport()
+         }
+     });
+ }
+-
+diff --git a/qt_client/tests/test_window_resize.cpp b/qt_client/tests/test_window_resize.cpp
+index 025d803a..30d66cff 100644
+--- a/qt_client/tests/test_window_resize.cpp
++++ b/qt_client/tests/test_window_resize.cpp
+@@ -198,6 +198,33 @@ void stopChildProcesses(QObject &root)
+     }
+ }
+ 
++class FakeBackend : public ChatBackend
++{
++public:
++    using ChatBackend::ChatBackend;
++
++    void sendChat(const QString &, const QString &) override {}
++    void sendDirect(const QString &, const QString &) override {}
++    void sendFile(const QString &, const QString &, const QString &,
++                  const QByteArray &) override {}
++    void sendReaction(const QString &, const QString &, const QString &) override {}
++    void editMessage(const QString &, const QString &, const QString &) override {}
++    void deleteMessage(const QString &, const QString &) override {}
++    void setAvatar(const QByteArray &) override {}
++    void sendTyping(const QString &, bool) override {}
++    void addChannel(const QString &) override {}
++    void setMirroredRepos(const QList<MirrorAdvert> &repos) override
++    {
++        adverts = repos;
++        ++setCalls;
++    }
++    void shutdown() override {}
++    QString modeName() const override { return QStringLiteral("fake"); }
++
++    QList<MirrorAdvert> adverts;
++    int setCalls = 0;
++};
++
+ } // namespace
+ 
+ int main(int argc, char *argv[])
+@@ -308,6 +335,54 @@ int main(int argc, char *argv[])
+               QStringLiteral("quick update pulls origin/HEAD in detached HEAD"));
+     }
+ 
++    {
++        QTemporaryDir mirrorDir;
++        QTemporaryDir fakeBin;
++        if (mirrorDir.isValid() && fakeBin.isValid()) {
++            QFile git(fakeBin.path() + QStringLiteral("/git"));
++            const bool scriptOk = git.open(QIODevice::WriteOnly);
++            if (scriptOk) {
++                git.write("#!/bin/sh\n"
++                          "if [ \"$3\" = count-objects ]; then\n"
++                          "  sleep 1\n"
++                          "  printf 'size: 1\\nsize-pack: 2\\n'\n"
++                          "  exit 0\n"
++                          "fi\n"
++                          "case \"$3\" in\n"
++                          "  symbolic-ref) printf 'main\\n' ;;\n"
++                          "  rev-parse) printf '0123456789abcdef0123456789abcdef01234567\\n' ;;\n"
++                          "  rev-list) printf '1\\n' ;;\n"
++                          "  for-each-ref) ;;\n"
++                          "  *) ;;\n"
++                          "esac\n"
++                          "exit 0\n");
++                git.close();
++                QFile::setPermissions(git.fileName(),
++                                      QFileDevice::ReadOwner |
++                                          QFileDevice::WriteOwner |
++                                          QFileDevice::ExeOwner);
++            }
++
++            const QByteArray oldPath = qgetenv("PATH");
++            qputenv("PATH", fakeBin.path().toUtf8() + ":" + oldPath);
++            FakeBackend backend;
++            MainWindow advertWindow;
++            advertWindow.testSetBackend(&backend);
++            advertWindow.testAddPublishedRepository(QStringLiteral("me"),
++                                                    QStringLiteral("slowrepo"),
++                                                    mirrorDir.path());
++            QElapsedTimer timer;
++            timer.start();
++            advertWindow.testRefreshRepositoryList();
++            const qint64 elapsedMs = timer.elapsed();
++            qputenv("PATH", oldPath);
++            advertWindow.testSetBackend(nullptr);
++            check(elapsedMs < 500,
++                  QStringLiteral("refreshRepositoryList does not wait for slow "
++                                 "git count-objects"));
++        }
++    }
++
+     // Issue #214: "Build & preview" checks the PR head out into a throwaway
+     // worktree, then CMake-configures and builds it. A fresh worktree is
+     // registered with `git worktree add`; a reused one is moved with a forced
