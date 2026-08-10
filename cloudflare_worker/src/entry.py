@@ -2233,6 +2233,8 @@ async def catalog_handler(env, request):
         if not await ed25519_verify(owner_pub, sig, canonical):
             return json_response({"error": "bad_signature"}, status=401)
         await d1_run(env, "DELETE FROM repositories WHERE key_bi=?", key_bi)
+        await _delete_repo_scoped_state(env, key_bi)
+        await _delete_bounties_namespace(env, owner, name)
         await edge_cache_delete(CATALOG_CACHE_KEY)
         return json_response({"ok": True, "deleted": True})
 
